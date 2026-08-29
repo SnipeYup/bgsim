@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: Rule tests
+        run: python -m pytest -q
+      - name: Invariant stress (random play, every action checked)
+        run: python -m bgsim stress --games 3000 --players 4 --workers 2
+      - name: Strength gate (expert vs random)
+        run: |
+          python -m bgsim run --agents expert,random,random,random --games 200 \
+            --rotate --workers 2 --out gate.csv | tee gate.md
+          python - << 'PY'
+          import re
+          txt = open("gate.md").read()
+          m = re.search(r"\| expert \| \d+ \|\s+([\d.]+)%", txt)
+          rate = float(m.group(1))
+          print(f"expert win rate: {rate}%")
+          assert rate >= 90, "expert agent no longer dominates random play"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-report
+          path: gate.md

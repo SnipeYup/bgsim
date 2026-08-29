@@ -1,0 +1,51 @@
+name: Simulate
+
+on:
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: "Comma-separated agent specs (random | expert | greedy | greedy:[...])"
+        default: "expert,expert,expert,expert"
+      games:
+        description: "Number of games"
+        default: "5000"
+      rotate:
+        description: "Rotate agents through seats"
+        type: boolean
+        default: false
+      evolve_generations:
+        description: "Generations of strategy search to run first (0 = skip)"
+        default: "0"
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Strategy search
+        if: ${{ inputs.evolve_generations != '0' }}
+        run: |
+          python -m bgsim evolve --generations ${{ inputs.evolve_generations }} \
+            --games-per-gen 120 --workers 2 --out best.json | tee evolve.log
+      - name: Simulate
+        run: |
+          AGENTS="${{ inputs.agents }}"
+          if [ -f best.json ]; then AGENTS="greedy@best.json,expert,expert,expert"; fi
+          ROTATE=""; if [ "${{ inputs.rotate }}" = "true" ] || [ -f best.json ]; then ROTATE="--rotate"; fi
+          python -m bgsim run --agents "$AGENTS" --games ${{ inputs.games }} \
+            $ROTATE --workers 2 --out results.csv | tee report.md
+      - name: Summary
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simulation-${{ github.run_number }}
+          path: |
+            report.md
+            results.csv
+            best.json
+            evolve.log
+          if-no-files-found: ignore
