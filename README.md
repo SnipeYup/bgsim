@@ -109,6 +109,15 @@ First findings from 600 all-expert games:
     check_invariants(state)            # raises on impossible states
     features(state, player) -> tuple   # cheap scalars for heuristic agents
 
+## Verification without an oracle
+
+`bgsim/trace.py` records full game traces; `bgsim/verify.py` runs independent
+rule-checkers over them. Checkers are generated in fresh sessions from single
+rulebook sections (protocol and prompt in `docs/VERIFIER.md`) so that engine
+and checker mistakes cannot coincide — every disagreement is an engine bug, a
+checker bug, or a rulebook ambiguity, and all three are worth surfacing.
+`checkers/<game>/` holds the checker set for each game.
+
 ## Next: the go/no-go experiment
 
 Give a model only this API (engine.py + this section) and the Splendor
