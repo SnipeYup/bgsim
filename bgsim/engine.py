@@ -71,9 +71,14 @@ def play_game(game: Game, agents: Sequence[Agent], seed: int,
     state = game.initial_state(n, seed)
     n_turns = 0
     n_actions = 0
+    unfinished = False
     while not game.is_terminal(state):
         if n_actions >= max_actions:
-            raise RuntimeError(f"game exceeded {max_actions} actions (seed={seed})")
+            # The rules allow play to continue forever (e.g. two players taking
+            # and discarding the same token). Score the game as it stands and
+            # flag it; the report counts these.
+            unfinished = True
+            break
         p = game.current_player(state)
         if game.phase(state) == "main":
             n_turns += 1
@@ -86,6 +91,7 @@ def play_game(game: Game, agents: Sequence[Agent], seed: int,
         if debug:
             game.check_invariants(state)
     extra = game.summary(state) if hasattr(game, "summary") else {}
+    extra["unfinished"] = unfinished
     return GameRecord(seed=seed, n_players=n, n_turns=n_turns,
                       n_actions=n_actions, winners=winners(game, state),
                       scores=game.scores(state),

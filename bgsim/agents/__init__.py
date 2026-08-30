@@ -42,6 +42,26 @@ class GreedyAgent:
         return self.rng.choice(best)
 
 
+class ScoreGreedyAgent:
+    """Game-agnostic one-ply: pick the action that maximises the player's own
+    score tuple in the resulting state, random tiebreak. Weak but needs no
+    features, so it works on any engine that implements `scores`."""
+    name = "scoregreedy"
+
+    def __init__(self, seed: int = 0):
+        self.rng = random.Random(seed)
+
+    def act(self, game: Game, state: State, player: int):
+        best, best_score = [], None
+        for a in game.legal_actions(state):
+            sc = game.scores(game.apply(state, a))[player]
+            if best_score is None or sc > best_score:
+                best, best_score = [a], sc
+            elif sc == best_score:
+                best.append(a)
+        return self.rng.choice(best)
+
+
 # Hand-written yardstick for Splendor (feature order: see Splendor.FEATURE_NAMES)
 EXPERT_WEIGHTS = (10.0, 2.0, 0.3, 0.6, 0.5, 0.8, 3.0, -0.2, -1.0)
 
@@ -53,6 +73,8 @@ def make_agent(spec: str, seed: int = 0):
     """
     if spec == "random":
         return RandomAgent(seed)
+    if spec == "scoregreedy":
+        return ScoreGreedyAgent(seed)
     if spec == "expert":
         return GreedyAgent(EXPERT_WEIGHTS, seed, name="expert")
     if spec == "greedy":

@@ -23,7 +23,9 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
     lines += ["## Game length",
               f"- rounds per game: mean {mean(rounds):.1f}, median {median(rounds):.1f}, "
               f"min {min(rounds):.0f}, max {max(rounds):.0f}",
-              f"- ties: {sum(1 for r in records if len(r.winners) > 1)}", ""]
+              f"- ties: {sum(1 for r in records if len(r.winners) > 1)}",
+              f"- unfinished (hit the action cap; rules allow indefinite play): "
+              f"{sum(1 for r in records if r.extra.get('unfinished'))}", ""]
 
     # --- seat advantage
     seat_wins = [0.0] * n_players
