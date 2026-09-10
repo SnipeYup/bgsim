@@ -834,6 +834,10 @@ class Agricola:
         for _ in range(2000):
             if st.terminal or st.phase == "main":
                 break
+            # Feeding settlements are rule events auditors must see: never
+            # fuse them into another transition, even when forced.
+            if st.phase == "feeding":
+                break
             acts = self.legal_actions(st)
             if len(acts) != 1:
                 break

@@ -4,3 +4,4 @@ __pycache__/
 results.csv
 *.json
 !bgsim/**/*.json
+mutants/

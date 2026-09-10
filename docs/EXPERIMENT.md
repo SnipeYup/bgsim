@@ -225,3 +225,31 @@ the protocol, standard library only. Requirements:
   choice at that point in the code, so it can be checked.
 
 Return only the complete `game.py`.
+
+
+---
+
+# Test 3: the verification compiler on its first rule (feeding, Agricola)
+
+An independent feeding/harvest checker was generated from ONLY the rulebook's
+Harvest chapter plus the trace schema (protocol in VERIFIER.md), then
+iterated against real traces. Result, 2026-09-09:
+
+- **5 checker rounds, 2 engine rounds (1 rules + 1 interface), 0 rules
+  errors on either side after engine round 1.** Every iteration was the two
+  sides discovering the unwritten trace contract: transition granularity,
+  phase whitelists, effects of unseen rulebook sections (craft buildings,
+  Well income). That contract is now written down (engine.py docstring,
+  VERIFIER.md prompt template), which should eliminate most rounds for
+  future checkers.
+- **Final state: baseline 25 games, zero findings. Mutation test
+  (tools/mutate_agricola.py): four feeding/breeding bugs caught with precise
+  diagnostics; a scoring bug correctly not caught (out of section — needs
+  the scoring checker).**
+- The checker found one genuine engine issue along the way: feeding
+  settlements fused invisibly into unrelated transitions (fixed by the
+  atomicity rule now in the engine API spec).
+
+Conclusion: the expert-log-reading step is replaceable. The designer-facing
+loop is: generated checkers audit automatically; disagreements arrive as
+concrete numbered questions; the mutation harness certifies coverage.
