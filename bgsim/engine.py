@@ -6,6 +6,13 @@ new state. Actions are small hashable tuples. All randomness happens in
 
 This is the surface a rules-to-code generator will target later, so keep it
 small and boring.
+
+Transition atomicity: `apply` may auto-resolve forced bookkeeping, but any
+state change that embodies a rule event (paying food, assigning penalty
+markers, breeding, scoring) must occur in a transition whose phase names
+that event — never fused into a transition of an unrelated phase. External
+auditors read traces transition by transition and must be able to attribute
+every delta to a rule.
 """
 from __future__ import annotations
 
