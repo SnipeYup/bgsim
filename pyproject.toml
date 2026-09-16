@@ -7,7 +7,11 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
+web = ["fastapi", "uvicorn"]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["bgsim"]

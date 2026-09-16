@@ -5,3 +5,5 @@ results.csv
 *.json
 !bgsim/**/*.json
 mutants/
+data/
+*.egg-info/
