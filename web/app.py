@@ -16,6 +16,7 @@ import importlib.util
 import json
 import sys
 import threading
+import traceback
 import time
 import uuid
 from pathlib import Path
@@ -95,6 +96,8 @@ def _run_in_thread(job: dict, fn) -> None:
         except Exception as e:  # surfaced to the UI, not swallowed
             job["status"] = "error"
             job["error"] = f"{type(e).__name__}: {e}"
+            job["trace"] = traceback.format_exc()
+            print(job["trace"], file=sys.stderr)
         job["elapsed"] = round(time.time() - job["started"], 1)
     threading.Thread(target=wrap, daemon=True).start()
 

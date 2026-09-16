@@ -229,7 +229,10 @@ async function generate(id){
     const job = await api('/projects/'+id+'/generate', {});
     await watch(job.id, st, 'Building the engine');
     open(id);
-  }catch(e){ st.className='status err'; st.textContent=e.message; }
+  }catch(e){ st.className='status err'; st.textContent=e.message;
+    if(e.trace){ const pre=document.createElement('pre');
+      pre.style.cssText='font-size:12px;white-space:pre-wrap;color:var(--ink-soft)';
+      pre.textContent=e.trace.split('\n').slice(-12).join('\n'); st.appendChild(pre); } }
 }
 
 async function runSim(id){
@@ -251,7 +254,8 @@ async function watch(jid, el, verb){
       el.className='status';
       el.innerHTML = `<span class="spin"></span>${verb}… ${j.detail||''}`;
       await new Promise(r=>setTimeout(r, 900));
-    } else if(j.status==='error'){ throw new Error(j.error);
+    } else if(j.status==='error'){
+      const err = new Error(j.error); err.trace = j.trace; throw err;
     } else return j;
   }
 }

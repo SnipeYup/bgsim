@@ -7,3 +7,4 @@ results.csv
 mutants/
 data/
 *.egg-info/
+.env
