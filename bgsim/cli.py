@@ -48,6 +48,17 @@ def main(argv=None):
     e.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     e.add_argument("--out", default="best.json")
 
+    x = sub.add_parser("exploit", help="evolve a counter to a target strategy")
+    x.add_argument("--game", default="splendor")
+    x.add_argument("--target", default=None, help="weights json from evolve (default: the built-in expert)")
+    x.add_argument("--players", type=int, default=4)
+    x.add_argument("--pop", type=int, default=16)
+    x.add_argument("--generations", type=int, default=8)
+    x.add_argument("--games-per-eval", type=int, default=24)
+    x.add_argument("--seed", type=int, default=0)
+    x.add_argument("--workers", type=int, default=os.cpu_count() or 1)
+    x.add_argument("--out", default="exploiter.json")
+
     s = sub.add_parser("stress", help="random playouts with invariants checked")
     s.add_argument("--game", default="splendor")
     s.add_argument("--games", type=int, default=10000)
@@ -78,6 +89,22 @@ def main(argv=None):
         for n, w in zip(names, res["weights"]):
             print(f"  {n:18s} {w:+.2f}")
         print(f"-> {a.out}  (use with --agents greedy@{a.out})")
+    elif a.cmd == "exploit":
+        import json as _json
+        from .agents import EXPERT_WEIGHTS
+        from .agents.exploit import exploit as _exploit
+        if a.target:
+            with open(a.target) as f:
+                tw = _json.load(f)["weights"]
+        else:
+            tw = list(EXPERT_WEIGHTS)
+        res = _exploit(a.game, tw, a.players, a.pop, a.generations,
+                       a.games_per_eval, a.seed, a.workers)
+        with open(a.out, "w") as f:
+            _json.dump(res, f, indent=2)
+        print(f"exploiter vs target: {res['exploiter_winrate_vs_target']:.0%} "
+              f"(baseline {res['baseline']:.0%}) -> {res['verdict']}")
+        print(f"-> {a.out}")
     elif a.cmd == "stress":
         specs = ["random"] * a.players
         recs, secs = simulate(a.game, specs, a.games, a.seed, a.workers, debug=True)

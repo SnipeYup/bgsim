@@ -21,6 +21,8 @@ MUTANTS = {
     "m4_hungry_newborns": ("need = 2 * (pl.family - pl.born) + pl.born",
                            "need = 2 * (pl.family - pl.born) + 2 * pl.born", 1),
     "m5_cheap_begging": ('"begging": -3 * pl.begging', '"begging": -1 * pl.begging', None),
+    "m6_cheap_people": ('"family": 3 * pl.family', '"family": 2 * pl.family', None),
+    "m7_free_sprawl": ('"unused spaces": -unused', '"unused spaces": 0', None),
 }
 
 

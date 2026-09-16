@@ -253,3 +253,22 @@ iterated against real traces. Result, 2026-09-09:
 Conclusion: the expert-log-reading step is replaceable. The designer-facing
 loop is: generated checkers audit automatically; disagreements arrive as
 concrete numbered questions; the mutation harness certifies coverage.
+
+
+## Mode change (2026-09-10)
+
+The fresh-session ritual existed to measure unaided generation; that
+measurement is complete. Development now runs in **harness-refereed mode**:
+checkers and fixes are written directly (by the assistant), and trust comes
+from the mutation matrix, not from process independence — a checker counts
+only if it is silent on the real engine and catches planted bugs it was
+never shown.
+
+First result in this mode: the **scoring checker** (checkers/agricola/
+scoring.py, including pasture detection by fence-enclosure flood fill) —
+baseline-clean over 25 games on its first run, and the full seven-mutant
+matrix is now caught: feeding checker takes m1-m4, scoring checker takes
+m5 (begging value), m6 (people value), m7 (unused-space penalty).
+The scoring-checker prompt package for the manual ritual is thereby
+obsolete. Remaining from the original plan: the hidden-information engine
+test, which will also run in harness-refereed mode.
