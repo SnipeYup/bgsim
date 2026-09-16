@@ -174,10 +174,16 @@ def generate(pid: str):
 def run_sim(pid: str, req: SimRequest):
     meta = _load(pid)
     _engine_for(meta)  # fail fast with a clear message before starting a job
-    job = _job("simulate", pid)
     specs = req.agents.split(",")
     if len(specs) == 1:
         specs = specs * req.players
+    elif len(specs) != req.players:
+        raise HTTPException(400, f"agents list has {len(specs)} seats but "
+                                 f"players is {req.players} — make them match")
+    if meta.get("builtin") != "splendor" and "expert" in specs:
+        raise HTTPException(400, "the 'expert' agent is Splendor-only; use "
+                                 "score-greedy for other games")
+    job = _job("simulate", pid)
 
     def work(j):
         j["detail"] = f"playing {req.games} games"

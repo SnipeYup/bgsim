@@ -192,10 +192,11 @@ function refresh0(p){
       <div><label for="g">Games</label><input id="g" type="number" value="500" min="1"></div>
       <div><label for="pl">Players</label><input id="pl" type="number" value="2" min="2" max="4"></div>
       <div><label for="ag">Agents</label>
-        <select id="ag">
+        <select id="ag" onchange="syncPlayers()">
           <option value="scoregreedy">score-greedy self-play</option>
-          <option value="expert">expert self-play (Splendor)</option>
-          <option value="expert,random,random,random">expert vs 3 random (Splendor, 4p)</option>
+          ${p.builtin==='splendor' ? `
+          <option value="expert">expert self-play</option>
+          <option value="expert,random,random,random">expert vs 3 random (4 players)</option>` : ''}
           <option value="random">random self-play</option>
         </select></div>
       <div class="go"><button class="btn amber" onclick="runSim('${p.id}')">Run the games</button></div>
@@ -206,6 +207,12 @@ function refresh0(p){
   if(p.has_report) loadReport(p.id);
   else $('#pad').innerHTML = canRun ?
     '<p class="empty">No report yet. Run the games and the score pad fills in here.</p>' : '';
+}
+
+function syncPlayers(){
+  const n = $('#ag').value.split(',').length;
+  if(n > 1){ $('#pl').value = n; $('#pl').disabled = true; }
+  else { $('#pl').disabled = false; }
 }
 
 async function generate(id){
