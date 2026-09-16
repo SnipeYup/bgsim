@@ -110,6 +110,7 @@ class SimRequest(BaseModel):
     games: int = 500
     players: int = 2
     agents: str = "scoregreedy"  # one spec for all seats, or comma list
+    rotate: bool = True          # cycle agents through seats between games
 
 
 # ---------------------------------------------------------------- endpoints
@@ -190,20 +191,28 @@ def run_sim(pid: str, req: SimRequest):
         game_name = BUILTIN[meta["builtin"]] if meta.get("builtin") else None
         if game_name:
             records, secs = simulate(game_name, specs, req.games, seed=0,
-                                     workers=2)
+                                     workers=2, rotate=req.rotate)
             game = make_game(game_name)
         else:  # generated engines: run in-process (no worker pool yet)
             game = _engine_for(meta)
             records = []
             t0 = time.time()
             for seed in range(req.games):
-                agents = [make_agent(s, seed * 100 + i) for i, s in enumerate(specs)]
-                records.append(play_game(game, agents, seed))
+                order = list(range(len(specs)))
+                if req.rotate:
+                    k = seed % len(specs)
+                    order = order[k:] + order[:k]
+                agents = [make_agent(specs[j], seed * 100 + i)
+                          for i, j in enumerate(order)]
+                rec = play_game(game, agents, seed)
+                rec.extra["seat_agent"] = [specs[j] for j in order]
+                records.append(rec)
             secs = time.time() - t0
         j["detail"] = "writing the report"
         md = make_report(records, game)
-        header = (f"_{req.games} games · {req.players} players · agents: "
-                  f"{req.agents} · {secs:.0f}s_\n\n")
+        header = (f"_{req.games} games · {req.players} players · seats: "
+                  f"{req.agents}{' · seats rotated' if req.rotate else ''} · "
+                  f"{secs:.0f}s_\n\n")
         (DATA / pid / "report.md").write_text(header + md)
         meta["has_report"] = True
         _save(meta)

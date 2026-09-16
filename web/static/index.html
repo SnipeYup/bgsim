@@ -73,6 +73,9 @@
   .runbar{display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end}
   .runbar > div{flex:1; min-width:120px}
   .runbar .go{flex:0}
+  .seats{display:flex; gap:6px; flex-wrap:wrap}
+  .seats select{width:auto; min-width:120px}
+  label input[type=checkbox]{vertical-align:-1px; margin-right:5px}
 
   /* the score-pad report */
   .pad{margin-top:20px}
@@ -190,29 +193,34 @@ function refresh0(p){
       `<p><button class="btn" onclick="generate('${p.id}')">Build the engine from the rulebook</button></p>`:''}
     <div class="runbar" ${canRun?'':'style="opacity:.5;pointer-events:none"'}>
       <div><label for="g">Games</label><input id="g" type="number" value="500" min="1"></div>
-      <div><label for="pl">Players</label><input id="pl" type="number" value="2" min="2" max="4"></div>
-      <div><label for="ag">Agents</label>
-        <select id="ag" onchange="syncPlayers()">
-          <option value="scoregreedy">score-greedy self-play</option>
-          ${p.builtin==='splendor' ? `
-          <option value="expert">expert self-play</option>
-          <option value="expert,random,random,random">expert vs 3 random (4 players)</option>` : ''}
-          <option value="random">random self-play</option>
-        </select></div>
+      <div><label for="pl">Players</label><input id="pl" type="number" value="2" min="2" max="4" onchange="buildSeats()"></div>
+      <div style="flex:2"><label>Who sits at the table</label>
+        <div id="seats" class="seats"></div>
+        <label style="margin-top:6px"><input type="checkbox" id="rot" checked> rotate seats between games (fair comparison)</label></div>
       <div class="go"><button class="btn amber" onclick="runSim('${p.id}')">Run the games</button></div>
     </div>
     <p class="status" id="simstat"></p>
     <div class="pad" id="pad"></div>
   </div>`;
+  window.__builtin = p.builtin; buildSeats();
   if(p.has_report) loadReport(p.id);
   else $('#pad').innerHTML = canRun ?
     '<p class="empty">No report yet. Run the games and the score pad fills in here.</p>' : '';
 }
 
-function syncPlayers(){
-  const n = $('#ag').value.split(',').length;
-  if(n > 1){ $('#pl').value = n; $('#pl').disabled = true; }
-  else { $('#pl').disabled = false; }
+function buildSeats(){
+  const n = Math.min(4, Math.max(2, +$('#pl').value || 2));
+  $('#pl').value = n;
+  const opts = [['scoregreedy','score-greedy'], ['random','random']];
+  if(window.__builtin==='splendor') opts.unshift(['expert','expert (Splendor)']);
+  const prev = [...document.querySelectorAll('#seats select')].map(s=>s.value);
+  $('#seats').innerHTML = Array.from({length:n}, (_,i)=>
+    `<select data-seat="${i}">${opts.map(([v,l])=>
+      `<option value="${v}" ${(prev[i]||opts[0][0])===v?'selected':''}>${l}</option>`).join('')}</select>`
+  ).join('');
+}
+function agentsString(){
+  return [...document.querySelectorAll('#seats select')].map(s=>s.value).join(',');
 }
 
 async function generate(id){
@@ -228,7 +236,8 @@ async function runSim(id){
   const st = $('#simstat');
   try{
     const job = await api('/projects/'+id+'/simulate', {
-      games:+$('#g').value, players:+$('#pl').value, agents:$('#ag').value});
+      games:+$('#g').value, players:+$('#pl').value, agents:agentsString(),
+      rotate:$('#rot').checked});
     await watch(job.id, st, 'Running');
     st.className='status ok'; st.textContent='Done.';
     loadReport(id);
