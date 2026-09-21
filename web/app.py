@@ -158,17 +158,41 @@ def generate(pid: str):
         raise HTTPException(400, "no rulebook on this project")
     job = _job("generate", pid)
 
-    def work(j):
-        j["detail"] = "asking the model for an engine"
-        code = llm.generate_engine(rb.read_text(encoding="utf-8"))
+    def validate(code: str) -> str | None:
+        """Write, load, play random games with invariants on. Returns None if
+        clean, else the traceback text to hand back to the model."""
         (DATA / pid / "game.py").write_text(code, encoding="utf-8")
+        try:
+            game = _engine_for(meta)
+            for n in (2, 3, 4):
+                for seed in range(12):
+                    agents = [make_agent("random", seed * 10 + i) for i in range(n)]
+                    play_game(game, agents, seed, debug=True)
+        except Exception:
+            return traceback.format_exc()
+        return None
+
+    def work(j):
+        rulebook = rb.read_text(encoding="utf-8")
+        j["detail"] = "asking the model for an engine"
+        code = llm.generate_engine(rulebook)
+        rounds = 0
         j["detail"] = "validating: random games with invariants on"
-        game = _engine_for(meta)
-        for seed in range(30):
-            agents = [make_agent("random", seed * 10 + i) for i in range(2)]
-            play_game(game, agents, seed, debug=True)
+        err = validate(code)
+        while err and rounds < 3:
+            rounds += 1
+            j["detail"] = f"validation failed — asking the model to fix it (round {rounds})"
+            code = llm.repair_engine(rulebook, code, err)
+            j["detail"] = f"re-validating after repair round {rounds}"
+            err = validate(code)
+        if err:
+            (DATA / pid / "last_error.txt").write_text(err, encoding="utf-8")
+            raise RuntimeError(f"engine still failing after {rounds} repair rounds; "
+                               f"last error: {err.strip().splitlines()[-1]}")
         meta["engine"] = "generated"
-        meta["validation"] = "30 random games, invariants held on every action"
+        meta["repair_rounds"] = rounds
+        meta["validation"] = (f"36 random games at 2-4 players, invariants held"
+                              + (f" · {rounds} repair round(s)" if rounds else " · first try"))
         _save(meta)
 
     _run_in_thread(job, work)

@@ -44,6 +44,7 @@ def _call_streaming(key: str, body: dict) -> str:
         headers={"content-type": "application/json", "x-api-key": key,
                  "anthropic-version": "2023-06-01", "accept": "text/event-stream"})
     out = []
+    stop = None
     with urllib.request.urlopen(req, timeout=120) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -58,10 +59,15 @@ def _call_streaming(key: str, body: dict) -> str:
                 d = evt.get("delta", {})
                 if d.get("type") == "text_delta":
                     out.append(d.get("text", ""))
+            elif t == "message_delta":
+                stop = evt.get("delta", {}).get("stop_reason", stop)
             elif t == "error":
                 raise RuntimeError(f"API error: {evt.get('error')}")
             elif t == "message_stop":
                 break
+    if stop == "max_tokens":
+        raise RuntimeError("model output was cut off at the length limit; "
+                           "the rulebook may be too large for one file")
     return "".join(out)
 
 
@@ -92,3 +98,40 @@ def generate_engine(rulebook: str) -> str:
     if "def initial_state" not in code:
         raise RuntimeError("model reply does not look like an engine file")
     return code
+
+
+REPAIR_PROMPT = """You previously wrote this board game engine (below). Running it produced the error at the bottom. Fix the engine so the error cannot recur, keeping every rule from the rulebook intact and the same public API. Return ONLY the complete corrected Python file, no fences, no commentary.
+
+=== engine.py (the protocol) ===
+{spec}
+
+=== rulebook ===
+{rulebook}
+
+=== your engine ===
+{code}
+
+=== error ===
+{error}
+"""
+
+
+def _clean(code: str) -> str:
+    code = code.strip()
+    if code.startswith("```"):
+        code = code.split("\n", 1)[1].rsplit("```", 1)[0]
+    return code
+
+
+def repair_engine(rulebook: str, code: str, error: str) -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set")
+    body = {"model": MODEL, "max_tokens": 32000,
+            "messages": [{"role": "user", "content": REPAIR_PROMPT.format(
+                spec=ENGINE_SPEC, rulebook=rulebook[:120_000], code=code,
+                error=error[-4000:])}]}
+    fixed = _clean(_call_streaming(key, body))
+    if "def initial_state" not in fixed:
+        raise RuntimeError("model repair reply does not look like an engine file")
+    return fixed
