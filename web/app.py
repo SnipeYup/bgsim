@@ -175,15 +175,21 @@ def generate(pid: str):
     def work(j):
         rulebook = rb.read_text(encoding="utf-8")
         j["detail"] = "asking the model for an engine"
-        code = llm.generate_engine(rulebook)
+        try:
+            code = llm.generate_engine(rulebook)
+        except llm.TruncatedOutput as e:
+            (DATA / pid / "partial.py").write_text(e.partial, encoding="utf-8")
+            raise
         rounds = 0
-        j["detail"] = "validating: random games with invariants on"
+        spent = [llm.cost_note()]
+        j["detail"] = f"validating: random games with invariants on ({spent[-1]})"
         err = validate(code)
         while err and rounds < 3:
             rounds += 1
             j["detail"] = f"validation failed — asking the model to fix it (round {rounds})"
             code = llm.repair_engine(rulebook, code, err)
-            j["detail"] = f"re-validating after repair round {rounds}"
+            spent.append(llm.cost_note())
+            j["detail"] = f"re-validating after repair round {rounds} ({spent[-1]})"
             err = validate(code)
         if err:
             (DATA / pid / "last_error.txt").write_text(err, encoding="utf-8")
@@ -192,7 +198,8 @@ def generate(pid: str):
         meta["engine"] = "generated"
         meta["repair_rounds"] = rounds
         meta["validation"] = (f"36 random games at 2-4 players, invariants held"
-                              + (f" · {rounds} repair round(s)" if rounds else " · first try"))
+                              + (f" · {rounds} repair round(s)" if rounds else " · first try")
+                              + " · model calls: " + "; ".join(spent))
         _save(meta)
 
     _run_in_thread(job, work)
