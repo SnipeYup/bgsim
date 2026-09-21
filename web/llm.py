@@ -9,7 +9,7 @@ from pathlib import Path
 
 MODEL = os.environ.get("BGSIM_MODEL", "claude-sonnet-5")
 API = "https://api.anthropic.com/v1/messages"
-ENGINE_SPEC = (Path(__file__).resolve().parent.parent / "bgsim" / "engine.py").read_text()
+ENGINE_SPEC = (Path(__file__).resolve().parent.parent / "bgsim" / "engine.py").read_text(encoding="utf-8")
 
 PROMPT = """You are implementing a board game as a deterministic simulation \
 engine for a balance-testing tool. Below is engine.py, defining the `Game` \

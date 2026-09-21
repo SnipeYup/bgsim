@@ -57,13 +57,13 @@ def _load(pid: str) -> dict:
     p = _meta_path(pid)
     if not p.exists():
         raise HTTPException(404, "project not found")
-    return json.loads(p.read_text())
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _save(meta: dict) -> None:
     d = DATA / meta["id"]
     d.mkdir(exist_ok=True)
-    _meta_path(meta["id"]).write_text(json.dumps(meta, indent=2))
+    _meta_path(meta["id"]).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 def _engine_for(meta: dict):
@@ -74,6 +74,7 @@ def _engine_for(meta: dict):
         raise HTTPException(400, "no engine yet — generate one first")
     spec = importlib.util.spec_from_file_location(f"gen_{meta['id']}", game_py)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # dataclasses resolve annotations via sys.modules
     spec.loader.exec_module(mod)
     for obj in vars(mod).values():
         if isinstance(obj, type) and hasattr(obj, "initial_state"):
@@ -121,7 +122,7 @@ class SimRequest(BaseModel):
 def list_projects():
     out = []
     for p in sorted(DATA.glob("*/meta.json")):
-        out.append(json.loads(p.read_text()))
+        out.append(json.loads(p.read_text(encoding="utf-8")))
     return out
 
 
@@ -138,7 +139,7 @@ def create_project(req: NewProject):
             "validation": None, "has_report": False}
     _save(meta)
     if req.rulebook.strip():
-        (DATA / pid / "rulebook.txt").write_text(req.rulebook)
+        (DATA / pid / "rulebook.txt").write_text(req.rulebook, encoding="utf-8")
     return meta
 
 
@@ -159,8 +160,8 @@ def generate(pid: str):
 
     def work(j):
         j["detail"] = "asking the model for an engine"
-        code = llm.generate_engine(rb.read_text())
-        (DATA / pid / "game.py").write_text(code)
+        code = llm.generate_engine(rb.read_text(encoding="utf-8"))
+        (DATA / pid / "game.py").write_text(code, encoding="utf-8")
         j["detail"] = "validating: random games with invariants on"
         game = _engine_for(meta)
         for seed in range(30):
@@ -216,7 +217,7 @@ def run_sim(pid: str, req: SimRequest):
         header = (f"_{req.games} games · {req.players} players · seats: "
                   f"{req.agents}{' · seats rotated' if req.rotate else ''} · "
                   f"{secs:.0f}s_\n\n")
-        (DATA / pid / "report.md").write_text(header + md)
+        (DATA / pid / "report.md").write_text(header + md, encoding="utf-8")
         meta["has_report"] = True
         _save(meta)
 
@@ -229,7 +230,7 @@ def get_report(pid: str):
     p = DATA / pid / "report.md"
     if not p.exists():
         raise HTTPException(404, "no report yet — run a simulation first")
-    return {"markdown": p.read_text()}
+    return {"markdown": p.read_text(encoding="utf-8")}
 
 
 @app.get("/api/jobs/{jid}")
