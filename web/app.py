@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import traceback
@@ -33,7 +34,10 @@ from bgsim.engine import play_game
 from bgsim.agents import make_agent
 from bgsim.games import make_game
 from bgsim.sim import simulate
+from bgsim.trace import record_trace, print_schema
+from bgsim.verify import load_checkers
 from web import llm
+from web.quality import quality_report, second_opinion
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -63,16 +67,20 @@ def _load(pid: str) -> dict:
 def _save(meta: dict) -> None:
     d = DATA / meta["id"]
     d.mkdir(exist_ok=True)
+    rec = SPEND.get(meta["id"])
+    if rec:
+        meta["spend_usd"] = rec["usd"]
+        meta["spend_by_model"] = rec["by_model"]
     _meta_path(meta["id"]).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def _engine_for(meta: dict):
+def _engine_for(meta: dict, filename: str = "game.py"):
     if meta.get("builtin"):
         return make_game(BUILTIN[meta["builtin"]])
-    game_py = DATA / meta["id"] / "game.py"
+    game_py = DATA / meta["id"] / filename
     if not game_py.exists():
         raise HTTPException(400, "no engine yet — generate one first")
-    spec = importlib.util.spec_from_file_location(f"gen_{meta['id']}", game_py)
+    spec = importlib.util.spec_from_file_location(f"gen_{meta['id']}_{filename[:-3]}", game_py)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod  # dataclasses resolve annotations via sys.modules
     spec.loader.exec_module(mod)
@@ -80,6 +88,25 @@ def _engine_for(meta: dict):
         if isinstance(obj, type) and hasattr(obj, "initial_state"):
             return obj()
     raise HTTPException(500, "generated file has no engine class")
+
+
+def _write_engine(pid: str, code: str, label: str) -> None:
+    """Write game.py, archiving the previous version so any change is reversible."""
+    d = DATA / pid
+    cur = d / "game.py"
+    vdir = d / "versions"
+    vdir.mkdir(exist_ok=True)
+    meta = _load(pid)
+    versions = meta.get("versions", [])
+    if cur.exists():
+        n = len(versions)
+        (vdir / f"v{n}.py").write_text(cur.read_text(encoding="utf-8"), encoding="utf-8")
+        versions.append({"v": n, "label": meta.get("current_label", "engine"),
+                         "time": time.time()})
+    cur.write_text(code, encoding="utf-8")
+    meta["versions"] = versions
+    meta["current_label"] = label
+    _save(meta)
 
 
 def _job(kind: str, pid: str) -> dict:
@@ -92,6 +119,9 @@ def _job(kind: str, pid: str) -> dict:
 def _run_in_thread(job: dict, fn) -> None:
     def wrap():
         try:
+            m = _load(job["project"]) if job.get("project") else {}
+            cx = m.get("complexity") or {"tier": "light", "budget_usd": BUDGET_USD["light"]}
+            llm.configure(cx["tier"], job.get("project"), cx["budget_usd"], m.get("spend_usd", 0.0))
             fn(job)
             job["status"] = "done"
         except Exception as e:  # surfaced to the UI, not swallowed
@@ -108,6 +138,50 @@ class NewProject(BaseModel):
     name: str
     rulebook: str = ""
     builtin: str | None = None  # "splendor" | "agricola"
+
+
+BUDGET_USD = {"light": 8.0, "heavy": 15.0}   # per-project model spend guard
+
+
+def _complexity(meta: dict) -> dict:
+    """Measured from the workshop's own outputs, no model call."""
+    ws = meta.get("workshop") or {}
+    rb = DATA / meta["id"] / "rulebook.txt"
+    words = len(rb.read_text(encoding="utf-8").split()) if rb.exists() else 0
+    actions = len(ws.get("cost_table", []))
+    lines = sum(len(sec["lines"]) for sec in ws.get("outline", []))
+    uncertain = len(ws.get("items", []))
+    steps = len(ws.get("walk", []))
+    score = words / 400 + actions * 1.5 + lines / 4 + uncertain + steps / 2
+    tier = "heavy" if (words > 4000 or actions > 12 or lines > 60 or score > 45) else "light"
+    return {"score": round(score, 1), "tier": tier, "words": words, "actions": actions,
+            "outline_lines": lines, "uncertain_items": uncertain, "budget_usd": BUDGET_USD[tier]}
+
+
+SPEND: dict[str, dict] = {}  # pid -> {"usd": float, "by_model": {...}}; merged into every _save
+
+
+def _record_cost(pid: str, model: str, usd: float) -> None:
+    rec = SPEND.setdefault(pid, {"usd": 0.0, "by_model": {}})
+    rec["usd"] = round(rec["usd"] + usd, 4)
+    rec["by_model"][model] = round(rec["by_model"].get(model, 0.0) + usd, 4)
+
+
+llm.on_cost = _record_cost
+
+
+MAX_WORKSHOP_PASSES = 5
+MAX_RULEBOOK_WORDS = 12000
+
+
+class WorkshopAnswer(BaseModel):
+    item_id: str
+    answer: str = ""      # empty answer + confirm=True means "the assumption is right"
+    confirm: bool = False
+
+
+class Answers(BaseModel):
+    answers: list[dict]  # [{"question": str, "answer": str}]
 
 
 class SimRequest(BaseModel):
@@ -148,11 +222,580 @@ def get_project(pid: str):
     return _load(pid)
 
 
+# ============================ rules workshop ==============================
+def _readiness(ws: dict) -> int:
+    items = ws.get("items", [])
+    if not items:
+        return 100
+    done = sum(1 for it in items if it["status"] != "open")
+    return int(round(100 * done / len(items)))
+
+
+@app.post("/api/projects/{pid}/workshop")
+def run_workshop(pid: str):
+    """Phase A: restate, walk a turn, ask + triage. Produces one open-items list."""
+    meta = _load(pid)
+    rb = DATA / pid / "rulebook.txt"
+    if not rb.exists():
+        raise HTTPException(400, "no rulebook on this project")
+    ws = meta.get("workshop") or {"pass": 0, "items": [], "history": []}
+    if ws["pass"] >= MAX_WORKSHOP_PASSES:
+        raise HTTPException(400, f"this rulebook has used its {MAX_WORKSHOP_PASSES} workshop "
+                                 f"passes; {sum(1 for i in ws['items'] if i['status']=='open')} "
+                                 f"item(s) still open usually means the rulebook needs an edit")
+    text = rb.read_text(encoding="utf-8")
+    if len(text.split()) > MAX_RULEBOOK_WORDS:
+        raise HTTPException(400, f"rulebook is over {MAX_RULEBOOK_WORDS:,} words")
+    job = _job("workshop", pid)
+
+    def work(j):
+        rulebook = rb.read_text(encoding="utf-8")
+        items = []
+        j["detail"] = "restating the rules as a structured outline"
+        restated = llm.restate_rules(rulebook)
+        for sec in restated["outline"]:
+            for ln in sec["lines"]:
+                if ln["basis"] in ("inferred", "unclear"):
+                    items.append({"kind": ln["basis"], "source": "outline",
+                                  "where": sec["section"], "text": ln["text"],
+                                  "assumption": ln["assumption"], "quote": ln["quote"]})
+        for row in restated["cost_table"]:
+            if row["basis"] in ("inferred", "unclear"):
+                items.append({"kind": row["basis"], "source": "cost table", "where": row["action"],
+                              "text": f"{row['action']}: costs {row['cost']}; effect: {row['effect']}",
+                              "assumption": "", "quote": ""})
+        j["detail"] = "walking through a sample round"
+        steps = llm.walk_turn(rulebook)
+        for st in steps:
+            if st["assumption"]:
+                items.append({"kind": "inferred", "source": "sample round", "where": "",
+                              "text": st["text"], "assumption": st["assumption"], "quote": ""})
+        j["detail"] = "looking for gaps and contradictions"
+        review = llm.review_rules(rulebook)
+        j["detail"] = "checking which questions the rulebook already answers"
+        triage = llm.triage_questions(rulebook, [r["question"] for r in review])
+        auto = 0
+        for r, t in zip(review, triage):
+            if t["answered"]:
+                auto += 1
+                items.append({"kind": r["kind"], "source": "review", "where": "", "text": r["question"],
+                              "assumption": t["answer"], "quote": t["quote"], "status": "auto",
+                              "answer": t["answer"]})
+            else:
+                items.append({"kind": r["kind"], "source": "review", "where": "", "text": r["question"],
+                              "assumption": "", "quote": r["quote"]})
+        # ids + default status
+        for k, it in enumerate(items):
+            it.setdefault("status", "open")
+            it.setdefault("answer", "")
+            it["id"] = f"p{ws['pass'] + 1}-{k}"
+        ws["pass"] += 1
+        ws["items"] = items
+        ws["outline"] = restated["outline"]
+        ws["cost_table"] = restated["cost_table"]
+        ws["walk"] = steps
+        ws["history"].append({"pass": ws["pass"], "open": sum(1 for i in items if i["status"] == "open"),
+                              "auto_answered": auto, "cost": llm.cost_note()})
+        ws["readiness"] = _readiness(ws)
+        meta["workshop"] = ws
+        meta["complexity"] = _complexity(meta)
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+class Budget(BaseModel):
+    budget_usd: float
+
+
+@app.post("/api/projects/{pid}/budget")
+def set_budget(pid: str, req: Budget):
+    meta = _load(pid)
+    cx = meta.get("complexity") or {"tier": "light", "score": 0}
+    cx["budget_usd"] = max(0.0, float(req.budget_usd))
+    meta["complexity"] = cx
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/answer")
+def workshop_answer(pid: str, req: WorkshopAnswer):
+    """Confirm an assumption or answer an item; the result is appended to the
+    rulebook as a clarification in the designer's words."""
+    meta = _load(pid)
+    ws = meta.get("workshop")
+    if not ws:
+        raise HTTPException(400, "run the workshop first")
+    it = next((i for i in ws["items"] if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such item")
+    if req.confirm and not req.answer.strip():
+        if not it.get("assumption"):
+            raise HTTPException(400, "nothing to confirm — type an answer")
+        it["status"] = "confirmed"; it["answer"] = it["assumption"]
+    elif req.answer.strip():
+        it["status"] = "answered"; it["answer"] = req.answer.strip()
+    else:
+        raise HTTPException(400, "type an answer or confirm the assumption")
+    rb = DATA / pid / "rulebook.txt"
+    text = rb.read_text(encoding="utf-8").rstrip()
+    if "## Clarifications from the designer" not in text:
+        text += "\n\n## Clarifications from the designer\n"
+    q = it["text"] if it["source"] == "review" else (it["assumption"] or it["text"])
+    text += f"- {q}\n  Designer: {it['answer']}\n"
+    rb.write_text(text + "\n", encoding="utf-8")
+    ws["readiness"] = _readiness(ws)
+    meta["workshop"] = ws
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/skip")
+def workshop_skip(pid: str, req: WorkshopAnswer):
+    """'Not sure' — leaves the item open but marks it deferred so it is not nagging."""
+    meta = _load(pid); ws = meta.get("workshop") or {}
+    it = next((i for i in ws.get("items", []) if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such item")
+    it["deferred"] = True
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/review")
+def review(pid: str):
+    """Stage 1: the model reads the rulebook and returns questions for the designer."""
+    meta = _load(pid)
+    rb = DATA / pid / "rulebook.txt"
+    if not rb.exists():
+        raise HTTPException(400, "no rulebook on this project")
+    job = _job("review", pid)
+
+    def work(j):
+        j["detail"] = "reading the rulebook for gaps, ambiguities and contradictions"
+        meta["review"] = llm.review_rules(rb.read_text(encoding="utf-8"))
+        meta["review_cost"] = llm.cost_note()
+        meta["clarified"] = False
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/clarify")
+def clarify(pid: str, req: Answers):
+    """Append the designer's answers to the rulebook as clarifications."""
+    meta = _load(pid)
+    rb = DATA / pid / "rulebook.txt"
+    answered = [a for a in req.answers if str(a.get("answer", "")).strip()]
+    if answered:
+        text = rb.read_text(encoding="utf-8").rstrip()
+        text += "\n\n## Clarifications from the designer\n"
+        for a in answered:
+            text += f"- Q: {a['question'].strip()}\n  A: {a['answer'].strip()}\n"
+        rb.write_text(text + "\n", encoding="utf-8")
+    meta["clarified"] = True
+    meta["clarifications"] = len(answered)
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/checkers")
+def build_checkers(pid: str):
+    """Stage 3: compile the rulebook into independent checkers and run them."""
+    meta = _load(pid)
+    game = _engine_for(meta)
+    rb = DATA / pid / "rulebook.txt"
+    if not rb.exists():
+        raise HTTPException(400, "no rulebook on this project")
+    job = _job("checkers", pid)
+
+    def work(j):
+        rulebook = rb.read_text(encoding="utf-8")
+        cdir = DATA / pid / "checkers"
+        cdir.mkdir(exist_ok=True)
+        j["detail"] = "recording a sample game for the trace format"
+        schema = print_schema(record_trace(game, ["random", "random"], 2, 0))
+        j["detail"] = "splitting the rulebook into auditable sections"
+        sections = llm.plan_checkers(rulebook)
+        for k, sec in enumerate(sections):
+            j["detail"] = f"writing checker {k + 1}/{len(sections)}: {sec['name']}"
+            (cdir / f"{sec['name']}.py").write_text(
+                llm.write_checker(sec["name"], sec["text"], schema), encoding="utf-8")
+        j["detail"] = "auditing 30 games with the new checkers"
+        run_checkers(meta, game, cdir)
+        meta["checkers_cost"] = llm.cost_note()
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
+    checkers = load_checkers(cdir)
+    results = {getattr(c, "NAME", c.__checker_file__): {"rule": getattr(c, "RULE", ""),
+               "gaps": [], "findings": []} for c in checkers}
+    specs_by_seed = [["random", "random"], ["scoregreedy", "scoregreedy"],
+                     ["random", "random", "random", "random"]]
+    for seed in range(n_games):
+        specs = specs_by_seed[seed % len(specs_by_seed)]
+        tr = record_trace(game, specs, len(specs), 500 + seed)
+        for c in checkers:
+            name = getattr(c, "NAME", c.__checker_file__)
+            try:
+                msgs = c.check(tr) or []
+            except Exception as e:
+                msgs = [f"CHECKER CRASHED: {type(e).__name__}: {e}"]
+            for m in msgs:
+                bucket = "gaps" if m.startswith("SCHEMA GAP") else "findings"
+                if m not in results[name][bucket]:
+                    results[name][bucket].append(m if bucket == "gaps" else f"game {seed}: {m}")
+    meta["checkers"] = [{"name": n, "rule": r["rule"], "gaps": r["gaps"][:3],
+                         "findings": r["findings"][:8], "n_findings": len(r["findings"])}
+                        for n, r in results.items()]
+    meta["checkers_games"] = n_games
+    # plain-language questions for every auditor that found something
+    with_findings = {n: r["findings"] for n, r in results.items() if r["findings"]}
+    if with_findings and os.environ.get("ANTHROPIC_API_KEY"):
+        rb = DATA / meta["id"] / "rulebook.txt"
+        if rb.exists():
+            try:
+                meta["checker_questions"] = llm.explain_findings(
+                    rb.read_text(encoding="utf-8"), with_findings)
+            except Exception as e:  # explanations are a convenience, never a blocker
+                meta["checker_questions"] = {"_error": str(e)}
+    else:
+        meta["checker_questions"] = {}
+
+
+@app.post("/api/projects/{pid}/checkers/rerun")
+def rerun_checkers(pid: str):
+    meta = _load(pid)
+    cdir = DATA / pid / "checkers"
+    if not cdir.exists():
+        raise HTTPException(400, "no checkers yet")
+    job = _job("checkers", pid)
+
+    def work(j):
+        j["detail"] = "auditing 30 games"
+        run_checkers(meta, _engine_for(meta), cdir)
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+class Resolution(BaseModel):
+    name: str                 # auditor name
+    decision: str             # "engine" | "auditor" | "rulebook"
+    note: str = ""            # clarification text when decision == "rulebook"
+
+
+@app.post("/api/projects/{pid}/checkers/resolve")
+def resolve_finding(pid: str, req: Resolution):
+    """The designer's verdict on an auditor's finding routes the fix."""
+    meta = _load(pid)
+    entry = next((c for c in meta.get("checkers", []) if c["name"] == req.name), None)
+    if not entry:
+        raise HTTPException(404, "no such auditor")
+    cdir = DATA / pid / "checkers"
+    if req.decision == "auditor":
+        # retire the auditor: rename so load_checkers skips it
+        f = cdir / f"{req.name}.py"
+        if f.exists():
+            f.rename(cdir / f"_{req.name}.py")
+        meta["checkers"] = [c for c in meta["checkers"] if c["name"] != req.name]
+        meta.setdefault("retired_auditors", []).append(req.name)
+        meta.get("checker_questions", {}).pop(req.name, None)
+        _save(meta)
+        return meta
+    if req.decision == "rulebook":
+        rb = DATA / pid / "rulebook.txt"
+        text = rb.read_text(encoding="utf-8").rstrip()
+        if "## Clarifications from the designer" not in text:
+            text += "\n\n## Clarifications from the designer\n"
+        q = meta.get("checker_questions", {}).get(req.name, {}).get("question", req.name)
+        text += f"- Q: {q}\n  A: {req.note.strip() or '(see designer note)'}\n"
+        rb.write_text(text + "\n", encoding="utf-8")
+        meta["needs_regeneration"] = True
+        _save(meta)
+        return meta
+    if req.decision == "engine":
+        job = _job("fix", pid)
+        findings = entry["findings"]
+
+        def work(j):
+            rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+            code = (DATA / pid / "game.py").read_text(encoding="utf-8")
+            error = (f"An independent auditor of the rule '{entry['rule']}' reports these "
+                     f"violations, and the designer has confirmed the engine is wrong:\n"
+                     + "\n".join(findings[:25]))
+            j["detail"] = f"fixing the engine for '{req.name}'"
+            new_code = llm.repair_engine(rulebook, code, error)
+            _write_engine(pid, new_code, f"fixed: {req.name}")
+            j["detail"] = "re-validating"
+            game = _engine_for(meta)
+            for seed in range(12):
+                play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+            j["detail"] = "re-auditing"
+            m2 = _load(pid)
+            run_checkers(m2, game, cdir)
+            m2["fix_rounds"] = m2.get("fix_rounds", 0) + 1
+            _save(m2)
+
+        _run_in_thread(job, work)
+        return job
+    raise HTTPException(400, "decision must be engine, auditor or rulebook")
+
+
+@app.get("/api/projects/{pid}/versions")
+def list_versions(pid: str):
+    meta = _load(pid)
+    return {"current": meta.get("current_label", "engine"), "versions": meta.get("versions", [])}
+
+
+@app.post("/api/projects/{pid}/versions/{v}/revert")
+def revert_version(pid: str, v: int):
+    meta = _load(pid)
+    f = DATA / pid / "versions" / f"v{v}.py"
+    if not f.exists():
+        raise HTTPException(404, "no such version")
+    label = next((x["label"] for x in meta.get("versions", []) if x["v"] == v), f"v{v}")
+    _write_engine(pid, f.read_text(encoding="utf-8"), f"reverted to v{v} ({label})")
+    m = _load(pid)
+    m["checkers"] = None; m["checker_questions"] = {}; m["quality"] = None; m["second_opinion"] = None
+    _save(m)
+    return m
+
+
+# ================================= jury ===================================
+def _wait_job(jid: str, timeout: float = 3600) -> dict:
+    t0 = time.time()
+    while JOBS[jid]["status"] == "running":
+        if time.time() - t0 > timeout:
+            raise RuntimeError("sub-step timed out")
+        time.sleep(1)
+    return JOBS[jid]
+
+
+def _repair_and_reaudit(pid: str, meta: dict, j: dict, reason: str, findings: list[str], label: str):
+    rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+    code = (DATA / pid / "game.py").read_text(encoding="utf-8")
+    error = reason + "\n" + "\n".join(findings[:25])
+    j["detail"] = f"fixing the engine: {label}"
+    new_code = llm.repair_engine(rulebook, code, error)
+    _write_engine(pid, new_code, f"fixed: {label}")
+    j["detail"] = "re-validating"
+    game = _engine_for(meta)
+    for seed in range(12):
+        play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+    j["detail"] = "re-auditing"
+    m2 = _load(pid)
+    run_checkers(m2, game, DATA / pid / "checkers")
+    m2["fix_rounds"] = m2.get("fix_rounds", 0) + 1
+    _save(m2)
+    return m2
+
+
+def run_jury(pid: str, j: dict) -> None:
+    """For every auditor with findings: frame a scenario, ask the proxy cold,
+    route by agreement. Unanimous -> fix; proxy sides with engine -> mute;
+    rulebook silent -> provisional ruling + inbox question."""
+    meta = _load(pid)
+    rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+    trail = meta.get("jury_trail", [])
+    inbox = meta.get("inbox", [])
+    fixes = 0
+    for c in list(meta.get("checkers") or []):
+        if not c["n_findings"]:
+            continue
+        j["detail"] = f"jury: {c['name']}"
+        fr = llm.frame_finding(c["name"], c["rule"], c["findings"])
+        px = llm.proxy_answer(rulebook, fr["scenario"], fr["question"])
+        entry = {"auditor": c["name"], "rule": c["rule"], **fr, "proxy": px, "time": time.time()}
+        if px["basis"] == "unclear" or not px["answer"]:
+            entry["verdict"] = "rulebook silent — provisional ruling kept, question queued"
+            inbox.append({"id": f"q{len(inbox) + 1}", "auditor": c["name"], "scenario": fr["scenario"],
+                          "question": fr["question"], "engine_value": fr["engine_value"],
+                          "auditor_value": fr["auditor_value"], "proxy_note": px["note"],
+                          "provisional": fr["engine_value"], "status": "open", "answer": ""})
+            c["status"] = "undecided"
+        else:
+            side = llm.compare_answer(fr["engine_value"], fr["auditor_value"], px["answer"])
+            entry["proxy_agrees_with"] = {"A": "engine", "B": "auditor"}.get(side, "neither")
+            if side == "B":
+                entry["verdict"] = "auditor + proxy agree the engine is wrong — fixed"
+                trail.append(entry)
+                meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
+                meta = _repair_and_reaudit(pid, meta, j, (
+                    "An independent auditor and an independent rules expert (reading the rulebook "
+                    f"only) agree the engine is wrong. Expert: {px['answer']} (\"{px['quote']}\")."),
+                    c["findings"], c["name"])
+                fixes += 1
+                continue
+            if side == "A":
+                entry["verdict"] = "proxy sides with the engine — auditor muted"
+                f = DATA / pid / "checkers" / f"{c['name']}.py"
+                if f.exists():
+                    f.rename(DATA / pid / "checkers" / f"_{c['name']}.py")
+                meta["checkers"] = [x for x in meta["checkers"] if x["name"] != c["name"]]
+                meta.setdefault("retired_auditors", []).append(c["name"])
+            else:
+                entry["verdict"] = "three different answers — question queued"
+                inbox.append({"id": f"q{len(inbox) + 1}", "auditor": c["name"], "scenario": fr["scenario"],
+                              "question": fr["question"], "engine_value": fr["engine_value"],
+                              "auditor_value": fr["auditor_value"], "proxy_note": f"expert read: {px['answer']}",
+                              "provisional": fr["engine_value"], "status": "open", "answer": ""})
+                c["status"] = "undecided"
+        trail.append(entry)
+        meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
+    m = _load(pid)
+    m["jury_trail"] = trail; m["inbox"] = inbox; m["jury_fixes"] = m.get("jury_fixes", 0) + fixes
+    m["jury_cost"] = llm.cost_note()
+    _save(m)
+
+
+@app.post("/api/projects/{pid}/jury")
+def jury(pid: str):
+    meta = _load(pid)
+    if not meta.get("checkers"):
+        raise HTTPException(400, "build the rule checkers first")
+    job = _job("jury", pid)
+    _run_in_thread(job, lambda j: run_jury(pid, j))
+    return job
+
+
+class InboxAnswer(BaseModel):
+    item_id: str
+    answer: str
+
+
+@app.post("/api/projects/{pid}/inbox/answer")
+def inbox_answer(pid: str, req: InboxAnswer):
+    """Designer settles a queued question. The answer becomes a clarification;
+    if it overturns the provisional ruling, the engine is fixed and re-audited."""
+    meta = _load(pid)
+    it = next((i for i in meta.get("inbox", []) if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such question")
+    it["status"] = "answered"; it["answer"] = req.answer.strip()
+    rb = DATA / pid / "rulebook.txt"
+    text = rb.read_text(encoding="utf-8").rstrip()
+    if "## Clarifications from the designer" not in text:
+        text += "\n\n## Clarifications from the designer\n"
+    text += f"- {it['question']} (scenario: {it['scenario']})\n  Designer: {it['answer']}\n"
+    rb.write_text(text + "\n", encoding="utf-8")
+    _save(meta)
+    side = llm.compare_answer(it["engine_value"], it["auditor_value"], it["answer"])
+    if side == "A":
+        it["outcome"] = "matches what the engine did — nothing to change"
+        _save(meta)
+        return {"meta": meta, "job": None}
+    job = _job("fix", pid)
+
+    def work(j):
+        m = _load(pid)
+        entry = next(i for i in m["inbox"] if i["id"] == req.item_id)
+        entry["outcome"] = "overturned the provisional ruling — engine fixed"
+        _save(m)
+        _repair_and_reaudit(pid, m, j, (
+            f"The designer has settled a rule: {it['question']} Scenario: {it['scenario']} "
+            f"Answer: {it['answer']}. The engine currently does: {it['engine_value']}."),
+            [], f"designer answer to {it['auditor']}")
+        # un-mark the auditor as undecided so it can be re-evaluated
+        m = _load(pid)
+        for c in m.get("checkers") or []:
+            c.pop("status", None)
+        _save(m)
+
+    _run_in_thread(job, work)
+    return {"meta": meta, "job": job}
+
+
+# =============================== the runner ===============================
+@app.post("/api/projects/{pid}/run-all")
+def run_all(pid: str, force: bool = False, games: int = 300):
+    """Phase B: everything after the workshop, unattended."""
+    meta = _load(pid)
+    if meta.get("builtin"):
+        raise HTTPException(400, "run-all is for generated engines")
+    ws = meta.get("workshop")
+    if not force and (not ws or ws.get("readiness", 0) < 100):
+        raise HTTPException(409, "rules readiness is below 100% — finish the workshop or pass force")
+    job = _job("run_all", pid)
+
+    def step(j, label, sub):
+        j["detail"] = label
+        r = _wait_job(sub["id"])
+        j.setdefault("steps", []).append({"step": label, "status": r["status"], "error": r.get("error")})
+        return r["status"] == "done"
+
+    def work(j):
+        m = _load(pid)
+        if m.get("engine") != "generated":
+            if not step(j, "building the engine", generate(pid, force=True)):
+                raise RuntimeError("engine generation failed; see steps")
+        ok = step(j, "rule checkers", build_checkers(pid))
+        step(j, "second opinion", run_second_opinion(pid))
+        if ok:
+            step(j, "jury", jury(pid))
+        step(j, "balance report", run_sim(pid, SimRequest(games=games, players=2,
+                                                            agents="scoregreedy", rotate=True)))
+        m = _load(pid)
+        m["last_run"] = {"time": time.time(), "steps": j.get("steps", []),
+                         "open_questions": sum(1 for i in m.get("inbox", []) if i["status"] == "open")}
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/fix-from-findings")
+def fix_from_findings(pid: str):
+    """Hand the checkers' findings to the model as a repair round, then re-audit."""
+    meta = _load(pid)
+    if meta.get("builtin"):
+        raise HTTPException(400, "built-in engines are not repaired here")
+    findings = [f for c in meta.get("checkers", []) for f in c["findings"]]
+    if not findings:
+        raise HTTPException(400, "no findings to fix")
+    job = _job("fix", pid)
+
+    def work(j):
+        rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+        code = (DATA / pid / "game.py").read_text(encoding="utf-8")
+        error = ("Independent rule auditors, written from the rulebook only, report "
+                 "these violations in games your engine played:\n" + "\n".join(findings[:25]))
+        j["detail"] = "asking the model to fix the engine from the auditors' findings"
+        code = llm.repair_engine(rulebook, code, error)
+        _write_engine(pid, code, "fixed from auditor findings")
+        j["detail"] = "re-validating"
+        game = _engine_for(meta)
+        for seed in range(12):
+            play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+        j["detail"] = "re-auditing"
+        run_checkers(meta, game, DATA / pid / "checkers")
+        meta["fix_rounds"] = meta.get("fix_rounds", 0) + 1
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
 @app.post("/api/projects/{pid}/generate")
-def generate(pid: str):
+def generate(pid: str, force: bool = False):
     meta = _load(pid)
     if meta.get("builtin"):
         raise HTTPException(400, "this project uses a built-in engine")
+    ws = meta.get("workshop")
+    if not force:
+        if not ws:
+            raise HTTPException(409, "run the rules workshop first — the engine is only as good as the rules it reads")
+        if ws.get("readiness", 0) < 100:
+            open_n = sum(1 for i in ws["items"] if i["status"] == "open")
+            raise HTTPException(409, f"rules readiness is {ws['readiness']}% with {open_n} open item(s); "
+                                     f"answer them, or build anyway knowing the engine will guess")
     rb = DATA / pid / "rulebook.txt"
     if not rb.exists():
         raise HTTPException(400, "no rulebook on this project")
@@ -161,7 +804,7 @@ def generate(pid: str):
     def validate(code: str) -> str | None:
         """Write, load, play random games with invariants on. Returns None if
         clean, else the traceback text to hand back to the model."""
-        (DATA / pid / "game.py").write_text(code, encoding="utf-8")
+        _write_engine(pid, code, "validating")
         try:
             game = _engine_for(meta)
             for n in (2, 3, 4):
@@ -186,8 +829,10 @@ def generate(pid: str):
         err = validate(code)
         while err and rounds < 3:
             rounds += 1
-            j["detail"] = f"validation failed — asking the model to fix it (round {rounds})"
-            code = llm.repair_engine(rulebook, code, err)
+            esc = rounds >= 2  # two failures: escalate to the stronger model
+            j["detail"] = (f"validation failed — asking the model to fix it (round {rounds}"
+                           + (", stronger model)" if esc else ")"))
+            code = llm.repair_engine(rulebook, code, err, escalate=esc)
             spent.append(llm.cost_note())
             j["detail"] = f"re-validating after repair round {rounds} ({spent[-1]})"
             err = validate(code)
@@ -195,11 +840,17 @@ def generate(pid: str):
             (DATA / pid / "last_error.txt").write_text(err, encoding="utf-8")
             raise RuntimeError(f"engine still failing after {rounds} repair rounds; "
                                f"last error: {err.strip().splitlines()[-1]}")
-        meta["engine"] = "generated"
-        meta["repair_rounds"] = rounds
-        meta["validation"] = (f"36 random games at 2-4 players, invariants held"
-                              + (f" · {rounds} repair round(s)" if rounds else " · first try")
-                              + " · model calls: " + "; ".join(spent))
+        j["detail"] = "engine quality checks: seat symmetry, termination, determinism"
+        meta["quality"] = quality_report(_engine_for(meta))
+        m = _load(pid)  # _write_engine updated versions; merge into the saved copy
+        m["engine"] = "generated"
+        m["current_label"] = f"generated ({rounds} repair rounds)" if rounds else "generated (first try)"
+        m["repair_rounds"] = rounds
+        m["validation"] = (f"36 random games at 2-4 players, invariants held"
+                           + (f" · {rounds} repair round(s)" if rounds else " · first try")
+                           + " · model calls: " + "; ".join(spent))
+        _save(m)
+        meta.update(m)
         _save(meta)
 
     _run_in_thread(job, work)
@@ -248,8 +899,68 @@ def run_sim(pid: str, req: SimRequest):
         header = (f"_{req.games} games · {req.players} players · seats: "
                   f"{req.agents}{' · seats rotated' if req.rotate else ''} · "
                   f"{secs:.0f}s_\n\n")
+        m_now = _load(pid)
+        prov = [i for i in m_now.get("inbox", []) if i["status"] == "open"]
+        if prov:
+            header += ("> **Provisional rulings.** This report assumes: " +
+                       "; ".join(f"{i['provisional']} ({i['auditor']})" for i in prov[:5]) +
+                       ". Answer the open questions to confirm.\n\n")
         (DATA / pid / "report.md").write_text(header + md, encoding="utf-8")
         meta["has_report"] = True
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/quality")
+def run_quality(pid: str):
+    meta = _load(pid)
+    game = _engine_for(meta)
+    job = _job("quality", pid)
+
+    def work(j):
+        j["detail"] = "playing random games at 2 and 4 players"
+        meta["quality"] = quality_report(game)
+        _save(meta)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/second-opinion")
+def run_second_opinion(pid: str):
+    """Generate an independent second engine from the same rulebook and
+    compare agent-free statistics. Agreement = evidence about the rules."""
+    meta = _load(pid)
+    if meta.get("builtin"):
+        raise HTTPException(400, "second opinions are for generated engines")
+    rb = DATA / pid / "rulebook.txt"
+    if not rb.exists() or meta.get("engine") != "generated":
+        raise HTTPException(400, "generate the first engine before asking for a second opinion")
+    job = _job("second_opinion", pid)
+
+    def work(j):
+        rulebook = rb.read_text(encoding="utf-8")
+        j["detail"] = "asking the model for an independent second engine"
+        code = llm.generate_engine(rulebook)
+        rounds = 0
+        while True:
+            (DATA / pid / "game2.py").write_text(code, encoding="utf-8")
+            try:
+                g2 = _engine_for(meta, "game2.py")
+                for seed in range(12):
+                    play_game(g2, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+                break
+            except Exception:
+                if rounds >= 3:
+                    raise RuntimeError("second engine still failing after 3 repair rounds")
+                rounds += 1
+                j["detail"] = f"second engine failed validation — repair round {rounds}"
+                code = llm.repair_engine(rulebook, code, traceback.format_exc())
+        j["detail"] = "comparing the two engines on random play"
+        meta["second_opinion"] = second_opinion(_engine_for(meta), _engine_for(meta, "game2.py"))
+        meta["second_opinion_cost"] = llm.cost_note()
         _save(meta)
 
     _run_in_thread(job, work)

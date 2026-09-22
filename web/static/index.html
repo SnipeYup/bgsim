@@ -92,6 +92,30 @@
   .pad ul{margin:6px 0; padding-left:20px}
   .pad li{margin:3px 0}
   .empty{color:var(--ink-soft); font-size:15px}
+  .stage{margin:12px 0; padding:10px 12px; background:#F1EEE4; border-radius:3px; font-size:14px}
+  .rq{margin:8px 0 4px; padding:6px 0; border-top:1px dashed var(--rule)}
+  .rq input{margin-top:4px}
+  .kind{font-size:11px; padding:1px 6px; border-radius:3px; background:var(--felt); color:var(--paper)}
+  .kind.missing{background:var(--alert)} .kind.contradiction{background:#7A2E1E}
+  .resolve{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px}
+  .resolve .btn{padding:5px 9px; font-size:12.5px}
+  .versions{font-size:13px; color:var(--ink-soft); margin:6px 0}
+  .vrow{padding:3px 0 3px 12px}
+  .inbox{border-left:4px solid var(--token)}
+  .meter{height:8px; background:#DDD7C6; border-radius:4px; margin:6px 0 4px; overflow:hidden}
+  .meter .fill{height:100%; background:var(--ok)}
+  .src{font-size:12px; color:var(--ink-soft)}
+  .ct{border-collapse:collapse; font-size:13px; margin:6px 0}
+  .ct td{padding:3px 10px 3px 0; border-bottom:1px solid var(--rule)}
+  .ct .basis{color:var(--ink-soft)} .ct tr.inferred td, li.inferred{background:#F6EBD9} .ct tr.unclear td, li.unclear{background:#F3DCD4}
+  .asm{color:var(--alert)}
+  .qual{margin-top:14px; border-top:1px solid var(--rule); padding-top:8px}
+  .qual h3{margin:0 0 6px; font-size:15px}
+  .qrow{display:flex; gap:8px; padding:5px 0; font-size:14px; border-bottom:1px dashed var(--rule)}
+  .qrow.flag{background:#F6EBD9; margin:0 -6px; padding:6px 6px; border-radius:3px}
+  .qi{width:16px; flex:none; text-align:center}
+  .qrow.pass .qi{color:var(--ok)} .qrow.flag .qi{color:var(--alert)} .qrow.info .qi{color:var(--ink-soft)}
+  .qq{margin-top:3px; color:var(--ink-soft); font-size:13px}
 </style>
 </head>
 <body>
@@ -185,12 +209,20 @@ function refresh0(p){
   $('#main').innerHTML = `
   <div class="sheet">
     <h2 class="display" style="margin:0">${p.name}</h2>
+    ${p.complexity ? `<p class="status">${p.complexity.tier==='heavy'?'Heavy game':'Light game'} (score ${p.complexity.score}: ${p.complexity.words.toLocaleString()} words, ${p.complexity.actions} actions) · model spend $${(p.spend_usd||0).toFixed(2)} of $${p.complexity.budget_usd.toFixed(0)} budget
+      <button class="btn" style="padding:2px 7px;font-size:11px;margin-left:6px" onclick="setBudget('${p.id}',${p.complexity.budget_usd})">change</button></p>` : (p.spend_usd?`<p class="status">model spend $${p.spend_usd.toFixed(2)}</p>`:'')}
     <p class="status" id="engstat">${
       p.builtin ? 'Engine: built-in '+p.builtin :
       p.engine==='generated' ? 'Engine: generated · '+(p.validation||'') :
       'No engine yet.'}</p>
+    ${!p.builtin ? renderReview(p) : ''}
+    ${!p.builtin ? renderVersions(p) : ''}
+    ${!p.builtin ? renderInbox(p) : ''}
+    ${!p.builtin && p.workshop && p.workshop.readiness===100 && !p.last_run ?
+      `<p><button class="btn amber" onclick="runAll('${p.id}')">Run everything — build, audit, second opinion, jury, report (~$1.50)</button> <span class="status" style="display:inline">You can leave; questions wait in the inbox.</span></p>`:''}
     ${!p.builtin && p.engine!=='generated' ?
-      `<p><button class="btn" onclick="generate('${p.id}')">Build the engine from the rulebook</button></p>`:''}
+      `<p><button class="btn" onclick="generate('${p.id}')">Build just the engine</button></p>`:''}
+    ${(p.builtin || p.engine==='generated') && !p.builtin ? renderCheckers(p) : ''}
     <div class="runbar" ${canRun?'':'style="opacity:.5;pointer-events:none"'}>
       <div><label for="g">Games</label><input id="g" type="number" value="500" min="1"></div>
       <div><label for="pl">Players</label><input id="pl" type="number" value="2" min="2" max="4" onchange="buildSeats()"></div>
@@ -199,10 +231,11 @@ function refresh0(p){
         <label style="margin-top:6px"><input type="checkbox" id="rot" checked> rotate seats between games (fair comparison)</label></div>
       <div class="go"><button class="btn amber" onclick="runSim('${p.id}')">Run the games</button></div>
     </div>
+    <div id="quality"></div>
     <p class="status" id="simstat"></p>
     <div class="pad" id="pad"></div>
   </div>`;
-  window.__builtin = p.builtin; buildSeats();
+  window.__builtin = p.builtin; buildSeats(); renderQuality(p);
   if(p.has_report) loadReport(p.id);
   else $('#pad').innerHTML = canRun ?
     '<p class="empty">No report yet. Run the games and the score pad fills in here.</p>' : '';
@@ -223,13 +256,188 @@ function agentsString(){
   return [...document.querySelectorAll('#seats select')].map(s=>s.value).join(',');
 }
 
-async function generate(id){
+function renderReview(p){ return renderWorkshop(p); }
+function renderWorkshop(p){
+  const ws = p.workshop;
+  if(!ws) return `<div class="stage"><b>Rules workshop</b> — before anything is built, the model restates your rules, walks a sample round, and asks about every place it had to guess. This is the part that decides whether everything after it is worth anything.
+    <p><button class="btn amber" onclick="runWorkshop('${p.id}')">Start the workshop (~$0.15)</button></p></div>`;
+  const open = ws.items.filter(i=>i.status==='open');
+  const shown = open.filter(i=>!i.deferred), deferred = open.filter(i=>i.deferred);
+  const auto = ws.items.filter(i=>i.status==='auto').length;
+  const meter = `<div class="meter"><div class="fill" style="width:${ws.readiness}%"></div></div>`;
+  const kindLabel = k => ({inferred:'assumed', unclear:'not settled', missing:'missing', ambiguous:'ambiguous', contradiction:'contradiction', undefined:'undefined'}[k]||k);
+  const itemHtml = i => `<div class="rq"><span class="kind ${i.kind}">${kindLabel(i.kind)}</span> <span class="src">${esc(i.source)}${i.where?' · '+esc(i.where):''}</span>
+      <div>${esc(i.text)}</div>
+      ${i.assumption?`<div class="qq">The model assumed: <i>${esc(i.assumption)}</i></div>`:''}
+      ${i.quote?`<div class="qq">From your rules: "${esc(i.quote)}"</div>`:''}
+      <div class="resolve">
+        ${i.assumption?`<button class="btn" onclick="wsAnswer('${p.id}','${i.id}','',true)">That's right</button>`:''}
+        <input type="text" id="ws-${i.id}" placeholder="${i.assumption?'or correct it in your words':'your answer'}" style="flex:1;min-width:180px">
+        <button class="btn amber" onclick="wsAnswer('${p.id}','${i.id}',$('#ws-${i.id}').value,false)">Save</button>
+        <button class="btn" onclick="wsSkip('${p.id}','${i.id}')">Not sure</button>
+      </div></div>`;
+  return `<div class="stage"><b>Rules workshop</b> — pass ${ws.pass} of ${5} · readiness <b>${ws.readiness}%</b>${meter}
+    <div class="qq">${ws.items.length} places the model wasn't certain · ${auto} answered from your own text · ${ws.items.length-open.length-auto} settled by you · ${open.length} open</div>
+    ${shown.length ? shown.map(itemHtml).join('') : (open.length ? '' : '<p class="status ok">Nothing open. Your rules are ready.</p>')}
+    ${deferred.length?`<details><summary>${deferred.length} set aside as "not sure"</summary>${deferred.map(itemHtml).join('')}</details>`:''}
+    <details><summary>Cost table as the model reads it (${ws.cost_table.length} actions)</summary><table class="ct">${ws.cost_table.map(r=>`<tr class="${r.basis}"><td>${esc(r.action)}</td><td>${esc(r.cost)}</td><td>${esc(r.effect)}</td><td class="basis">${r.basis}</td></tr>`).join('')}</table></details>
+    <details><summary>A sample round, as the model would play it</summary><ol>${ws.walk.map(s=>`<li>${esc(s.text)}${s.assumption?` <i class="asm">(assumed: ${esc(s.assumption)})</i>`:''}</li>`).join('')}</ol></details>
+    <details><summary>Full outline (${ws.outline.reduce((n,s)=>n+s.lines.length,0)} lines — you don't need to read this)</summary>${ws.outline.map(s=>`<b>${esc(s.section)}</b><ul>${s.lines.map(l=>`<li class="${l.basis}">${esc(l.text)}</li>`).join('')}</ul>`).join('')}</details>
+    <p>${ws.pass<5?`<button class="btn" onclick="runWorkshop('${p.id}')">Re-review with my answers (~$0.15)</button>`:'<span class="status err">All 5 passes used — remaining open items usually mean the rulebook needs an edit.</span>'}</p></div>`;
+}
+async function runWorkshop(id){
+  const st = $('#engstat');
+  try{ const job = await api('/projects/'+id+'/workshop', {}); await watch(job.id, st, 'Workshop'); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+async function wsAnswer(id, item, answer, confirm){
+  const st = $('#engstat');
+  try{ await api('/projects/'+id+'/workshop/answer', {item_id:item, answer, confirm}); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+async function wsSkip(id, item){ await api('/projects/'+id+'/workshop/skip', {item_id:item}); open(id); }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+async function runReview(id){
+  const st = $('#engstat');
+  try{ const job = await api('/projects/'+id+'/review', {}); await watch(job.id, st, 'Reviewing'); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+async function clarify(id){
+  const p = await api('/projects/'+id);
+  const answers = (p.review||[]).map((r,i)=>({question:r.question, answer: ($('#ans'+i)||{}).value||''}));
+  await api('/projects/'+id+'/clarify', {answers}); open(id);
+}
+function renderCheckers(p){
+  const c = p.checkers;
+  if(!c) return `<div class="stage"><b>3 · Rule checks</b> — an independent model turns each section of your rules into an auditor that inspects every game.
+    <p><button class="btn" style="padding:7px 12px;font-size:14px" onclick="runCheckers('${p.id}')">Build rule checkers (~$0.40)</button></p></div>`;
+  const total = c.reduce((n,x)=>n+x.n_findings,0);
+  const qs = p.checker_questions || {};
+  const rows = c.map(x=>{
+    if(!x.n_findings) return `<div class="qrow pass"><span class="qi">&#10003;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — checked, no problems${x.gaps.length?` <span class="qq" style="display:inline">(couldn't verify part of it: ${esc(x.gaps[0].replace(/^SCHEMA GAP:\s*/,''))})</span>`:''}</span></div>`;
+    const q = qs[x.name];
+    const body = q ? `<div class="qq"><b>What happened:</b> ${esc(q.what_happened)}<br><b>Rule:</b> "${esc(q.rule)}"<br><b>Question:</b> ${esc(q.question)}</div>`
+                   : `<div class="qq">${x.findings.slice(0,3).map(esc).join('<br>')}</div>`;
+    return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${x.n_findings} game(s) affected${body}
+      <div class="resolve">Which is right?
+        <button class="btn amber" onclick="resolve('${p.id}','${x.name}','engine')">The simulation is wrong — fix it (~$0.20)</button>
+        <button class="btn" onclick="resolve('${p.id}','${x.name}','auditor')">The auditor misread my rules — ignore it</button>
+        <button class="btn" onclick="resolveRulebook('${p.id}','${x.name}')">My rules are unclear — clarify</button>
+      </div></span></div>`;
+  }).join('');
+  return `<div class="stage"><b>3 · Rule checks</b> — ${c.length} auditor(s) over ${p.checkers_games} games: ${total? total+' finding(s), your call below':'all clean'}${p.fix_rounds?` · ${p.fix_rounds} fix round(s)`:''}${p.needs_regeneration?' · <b>rules changed — rebuild the engine</b>':''}
+    ${rows}<p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}')">Re-audit</button></p></div>`;
+}
+async function resolve(id, name, decision, note){
   const st = $('#engstat');
   try{
-    const job = await api('/projects/'+id+'/generate', {});
+    const r = await api('/projects/'+id+'/checkers/resolve', {name, decision, note: note||''});
+    if(r.id && decision!=='engine'){ open(id); return; }
+    await watch(r.id, st, 'Fixing'); open(id);
+  }catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+function resolveRulebook(id, name){
+  const note = prompt('Write the clarification in your own words — it gets added to your rulebook:');
+  if(note===null) return;
+  resolve(id, name, 'rulebook', note);
+}
+function renderInbox(p){
+  const inbox = p.inbox || []; const open = inbox.filter(i=>i.status==='open');
+  const trail = p.jury_trail || [];
+  if(!inbox.length && !trail.length) return '';
+  const q = i => `<div class="rq"><b>${esc(i.question)}</b><div class="qq">${esc(i.scenario)}</div>
+    <div class="qq">The simulation did: <b>${esc(i.engine_value)}</b> · the auditor expected: <b>${esc(i.auditor_value)}</b>${i.proxy_note?` · rules expert: ${esc(i.proxy_note)}`:''}</div>
+    <div class="qq">Meanwhile the report assumes: ${esc(i.provisional)}</div>
+    <div class="resolve"><input type="text" id="ib-${i.id}" placeholder="your answer, in your words" style="flex:1;min-width:200px">
+    <button class="btn amber" onclick="inboxAnswer('${p.id}','${i.id}')">Settle it</button></div></div>`;
+  const done = inbox.filter(i=>i.status!=='open');
+  return `<div class="stage inbox"><b>Inbox</b> — ${open.length? open.length+' question(s) only you can answer' : 'no open questions'}
+    ${open.map(q).join('')}
+    ${done.length?`<details><summary>${done.length} settled</summary>${done.map(i=>`<div class="qq">${esc(i.question)} → <b>${esc(i.answer)}</b> · ${esc(i.outcome||'')}</div>`).join('')}</details>`:''}
+    ${trail.length?`<details><summary>Jury trail — ${trail.length} automatic decision(s)</summary>${trail.map(e=>`<div class="qq"><b>${esc(e.auditor)}</b>: ${esc(e.verdict)}${e.proxy&&e.proxy.quote?` · "${esc(e.proxy.quote)}"`:''}</div>`).join('')}</details>`:''}
+  </div>`;
+}
+async function inboxAnswer(id, item){
+  const st = $('#engstat'); const a = $('#ib-'+item).value;
+  if(!a.trim()) return;
+  try{ const r = await api('/projects/'+id+'/inbox/answer', {item_id:item, answer:a});
+       if(r.job){ await watch(r.job.id, st, 'Applying your answer'); } open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+async function setBudget(id, cur){
+  const v = prompt('Model spend budget for this game, in dollars:', cur);
+  if(v===null) return;
+  await api('/projects/'+id+'/budget', {budget_usd: +v}); open(id);
+}
+async function runAll(id){
+  const st = $('#engstat');
+  try{ const job = await api('/projects/'+id+'/run-all', {}); await watch(job.id, st, 'Running everything'); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+function renderVersions(p){
+  const v = p.versions || [];
+  if(!v.length && !p.current_label) return '';
+  return `<details class="versions"><summary>Engine version: ${esc(p.current_label||'engine')}${v.length?` · ${v.length} earlier`:''}</summary>
+    ${v.slice().reverse().map(x=>`<div class="vrow">v${x.v} · ${esc(x.label)} <button class="btn" style="padding:3px 8px;font-size:12px" onclick="revertTo('${p.id}',${x.v})">Revert to this</button></div>`).join('')}
+  </details>`;
+}
+async function revertTo(id, v){
+  if(!confirm('Revert the engine to this version? Audits and reports will need re-running.')) return;
+  await api('/projects/'+id+'/versions/'+v+'/revert', {}); open(id);
+}
+async function runCheckers(id){ await stageJob(id, '/checkers', 'Building checkers'); }
+async function rerunCheckers(id){ await stageJob(id, '/checkers/rerun', 'Auditing'); }
+async function fixFindings(id){ await stageJob(id, '/fix-from-findings', 'Fixing'); }
+async function stageJob(id, path, verb){
+  const st = $('#engstat');
+  try{ const job = await api('/projects/'+id+path, {}); await watch(job.id, st, verb); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+
+function renderQuality(p){
+  const q = p.quality; const el = $('#quality');
+  if(!q){ el.innerHTML = (p.builtin||p.engine==='generated') ?
+    `<p class="status"><button class="btn" style="padding:7px 12px;font-size:14px" onclick="runQuality('${p.id}')">Check engine quality</button></p>` : ''; return; }
+  const icon = s => s==='pass' ? '&#10003;' : s==='flag' ? '&#9888;' : '&#8226;';
+  const so = p.second_opinion;
+  const soHtml = so ? `<h3 style="margin-top:12px">Second opinion — two independent engines</h3>` + so.map(c =>
+    `<div class="qrow ${c.status}"><span class="qi">${icon(c.status)}</span>
+     <span><b>${c.check}</b> — ${c.detail}${c.question?`<div class="qq">${c.question}</div>`:''}</span></div>`).join('')
+    : (!p.builtin ? `<p class="status"><button class="btn" style="padding:6px 10px;font-size:13px" onclick="runSecond('${p.id}')">Get a second opinion (generates a second engine, ~$0.20)</button></p>` : '');
+  el.innerHTML = `<div class="qual"><h3>Engine correctness</h3>` + q.map(c =>
+    `<div class="qrow ${c.status}"><span class="qi">${icon(c.status)}</span>
+     <span><b>${c.check}</b> — ${c.detail}${c.question?`<div class="qq">${c.question}</div>`:''}</span></div>`
+  ).join('') + soHtml + `<p class="status"><button class="btn" style="padding:6px 10px;font-size:13px" onclick="runQuality('${p.id}')">Re-check</button></p></div>`;
+}
+async function runSecond(id){
+  const el = $('#quality');
+  try{
+    const job = await api('/projects/'+id+'/second-opinion', {});
+    const st = document.createElement('p'); st.className='status'; el.prepend(st);
+    await watch(job.id, st, 'Second opinion');
+    open(id);
+  }catch(e){ el.innerHTML += `<p class="status err">${e.message}</p>`; }
+}
+async function runQuality(id){
+  const el = $('#quality');
+  try{
+    const job = await api('/projects/'+id+'/quality', {});
+    const st = document.createElement('p'); st.className='status'; el.prepend(st);
+    await watch(job.id, st, 'Checking');
+    open(id);
+  }catch(e){ el.innerHTML = `<p class="status err">${e.message}</p>`; }
+}
+
+async function generate(id, force){
+  const st = $('#engstat');
+  try{
+    const job = await api('/projects/'+id+'/generate'+(force?'?force=true':''), {});
     await watch(job.id, st, 'Building the engine');
     open(id);
   }catch(e){ st.className='status err'; st.textContent=e.message;
+    if(!force && /readiness|workshop first/.test(e.message)){
+      const b=document.createElement('button'); b.className='btn'; b.style.cssText='margin-left:8px;padding:4px 8px;font-size:12px';
+      b.textContent='Build anyway (the engine will guess)'; b.onclick=()=>generate(id,true); st.appendChild(b); }
     if(e.trace){ const pre=document.createElement('pre');
       pre.style.cssText='font-size:12px;white-space:pre-wrap;color:var(--ink-soft)';
       pre.textContent=e.trace.split('\n').slice(-12).join('\n'); st.appendChild(pre); } }

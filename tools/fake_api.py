@@ -35,8 +35,60 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n))
         assert body.get("stream") is True, "client must stream"
         assert body["output_config"]["effort"] in ("low", "medium", "high"), "effort missing"
-        assert body["max_tokens"] >= 64000
+        assert body["max_tokens"] >= 100
         text = body["messages"][0]["content"]
+        # ---- non-engine prompts: review / plan / checker
+        if "Turn them into ONE concrete scenario" in text:
+            return self._stream_text(json.dumps({"scenario": "Round 9 harvest: a family of 4 adults and 1 newborn with 7 food.",
+                "question": "How much food does this family owe?", "engine_value": "8 food", "auditor_value": "9 food"}))
+        if "You are a rules expert. Using ONLY the rulebook" in text:
+            if "[JURY:unclear]" in text: return self._stream_text(json.dumps({"answer": "", "basis": "unclear", "quote": "", "note": "the rulebook never defines newborn"}))
+            if "[JURY:engine]" in text: return self._stream_text(json.dumps({"answer": "8 food", "basis": "stated", "quote": "2 per person", "note": ""}))
+            return self._stream_text(json.dumps({"answer": "9 food: 2 per adult and 1 for the newborn", "basis": "stated", "quote": "newborn only requires 1 food", "note": ""}))
+        if "Say which candidate the expert's answer agrees with" in text:
+            ans = text.split("Expert's answer:")[1]
+            side = "A" if "8 food" in ans else "B" if "9" in ans else "neither"
+            return self._stream_text(json.dumps({"agrees_with": side}))
+        if "restating a board game rulebook as a precise structured outline" in text:
+            return self._stream_text(json.dumps({"outline": [
+                {"section": "setup", "lines": [
+                    {"text": "Each player starts with 3 food.", "basis": "stated", "assumption": "", "quote": "each other player gets 3 food"},
+                    {"text": "The first field may be placed anywhere.", "basis": "inferred", "assumption": "no adjacency needed for the first field", "quote": ""}]},
+                {"section": "end of game", "lines": [
+                    {"text": "Ties are unresolved.", "basis": "unclear", "assumption": "shared victory", "quote": ""}]}],
+                "cost_table": [{"action": "Build room", "cost": "5 wood 2 reed", "effect": "one room", "basis": "stated"},
+                               {"action": "Build stable", "cost": "2 wood", "effect": "one stable", "basis": "inferred"}]}))
+        if "narrate one complete sample round of play" in text:
+            return self._stream_text(json.dumps({"steps": [
+                {"text": "Player 1 takes 3 wood from the Forest.", "assumption": ""},
+                {"text": "Player 2 plows a field next to their house.", "assumption": "fields need not be adjacent to the house"}]}))
+        if "decide whether the rulebook text actually" in text:
+            n = text.split("=== questions ===")[1].count("\n")
+            return self._stream_text(json.dumps([{"answered": True, "answer": "Exactly three; the text says 'three different colours'.", "quote": "three gem tokens of different colours"}] + [{"answered": False, "answer": "", "quote": ""}] * max(0, n - 1)))
+        if "meticulous board game rules editor" in text:
+            return self._stream_text(json.dumps([
+                {"kind": "ambiguous", "quote": "take 3 gem tokens of different colours",
+                 "question": "May a player take fewer than 3 different tokens by choice?"},
+                {"kind": "missing", "quote": "End of the game",
+                 "question": "If two players tie on points and card count, who wins?"}]))
+        if "explain simulation audit results" in text:
+            import re
+            names = re.findall(r"^\[(\w+)\]", text.split("=== auditor findings ===")[1], re.M)
+            return self._stream_text(json.dumps([{
+                "name": n, "what_happened": f"In several games a rule about {n} was applied differently from the rulebook.",
+                "rule": "the relevant rulebook phrase", "question": f"Is the engine's handling of {n} correct?"} for n in names]))
+        if "Split the rulebook below into" in text:
+            return self._stream_text(json.dumps([
+                {"name": "turn_order", "text": "Players take turns in order. Each turn one action."},
+                {"name": "end_game", "text": "The game ends after round 14."}]))
+        if "You are writing an independent auditor" in text:
+            name = text.split('NAME = "')[1].split('"')[0]
+            checker = (f'NAME = "{name}"\nRULE = "fake checker for {name}"\n\n'
+                       f'def check(trace):\n'
+                       f'    out = []\n'
+                       f'    if trace["meta"]["n_players"] < 1: out.append("step 0: impossible")\n'
+                       f'    return out\n')
+            return self._stream_text(checker)
         scenario = "ok"
         for s in ("truncate", "reset", "error"):
             if f"[SCENARIO:{s}]" in text:
@@ -71,6 +123,21 @@ class H(BaseHTTPRequestHandler):
         w.write(sse({"type": "message_delta",
                      "delta": {"stop_reason": "max_tokens" if scenario == "truncate" else "end_turn"},
                      "usage": {"output_tokens": 25000}}))
+        w.write(sse({"type": "message_stop"}))
+
+
+    def _stream_text(self, text: str):
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        w = self.wfile
+        w.write(sse({"type": "message_start", "message": {"usage": {"input_tokens": 3000}}}))
+        w.write(sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}))
+        w.write(sse({"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "text_delta", "text": text}}))
+        w.write(sse({"type": "content_block_stop", "index": 0}))
+        w.write(sse({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                     "usage": {"output_tokens": 800}}))
         w.write(sse({"type": "message_stop"}))
 
 
