@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -56,6 +57,11 @@ def effort_for(role: str) -> str:
     if role != "engine":
         return "medium"
     return os.environ.get("BGSIM_EFFORT", EFFORTS.get(getattr(_ctx, "tier", "light"), "medium"))
+
+
+def _supports_effort(model: str) -> bool:
+    """The effort setting exists on Opus 4.5+, Sonnet 4.6+ and Sonnet 5; not on Haiku 4.5."""
+    return not model.startswith("claude-haiku")
 
 
 def _spend_check(model: str) -> None:
@@ -112,6 +118,8 @@ def _call_streaming(key: str, body: dict) -> str:
     """Stream the response so the connection never looks idle; assemble the
     text deltas. Returns the full text."""
     body = dict(body, stream=True)
+    if not _supports_effort(body.get("model", MODEL)):
+        body.pop("output_config", None)
     _spend_check(body.get("model", MODEL))
     req = urllib.request.Request(
         API, data=json.dumps(body).encode(),
@@ -120,7 +128,12 @@ def _call_streaming(key: str, body: dict) -> str:
     out = []
     stop = None
     completed = False
-    with urllib.request.urlopen(req, timeout=120) as r:
+    try:
+        r = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"API {e.code} for model {body.get('model')}: {detail}") from None
+    with r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -296,7 +309,9 @@ PLAN_PROMPT = """Split the rulebook below into 3 to 6 self-contained rule sectio
 that could each be audited independently over a record of a played game — for \
 example: turn structure and turn order; costs and payments; a scoring or \
 end-of-game rule; a resource or supply rule; a limit or capacity rule. Prefer \
-sections that state exact numbers. Return ONLY a JSON array: \
+sections that state exact numbers. Sections must be DISJOINT: each rule \
+belongs to exactly one section, and no two sections may cover the same limit, \
+cost, or phase. Return ONLY a JSON array: \
 [{{"name": "<short_snake_case>", "text": "<the verbatim rulebook text of that \
 section, complete>"}}].
 
@@ -323,6 +338,10 @@ information the rule needs, return one message starting with "SCHEMA GAP:" \
 instead of guessing. Be strict on what the section states, silent on what it \
 doesn't.
 
+Timing matters: a rule stated for a moment ("at the end of your turn", "at \
+harvest", "when the game ends") must be checked only at that moment — for an \
+end-of-turn limit, only at transitions where the acting player changes, never \
+in mid-turn sub-phases where the engine may be about to enforce the limit. \
 Trace contract you may rely on: a transition's `before`/`after` are full \
 states; the engine may auto-resolve forced bookkeeping but every rule event \
 (payments, penalties, scoring) occurs in a transition whose `phase` names \
@@ -374,8 +393,10 @@ independent auditors (each auditor checks one rule; its findings are terse \
 and technical). For EACH auditor, write one plain-English item: what happened \
 in the simulated games in the designer's own terms (rounds, players, \
 resources — never "step", "trace", "state" or code words), which rule it \
-concerns (quote the rulebook phrase), and a single question the designer can \
-answer. Do not decide who is right; the engine that played the games, the \
+concerns (quote the rulebook phrase), and a single FACTUAL question about that concrete moment — "with 11 \
+tokens after taking three, what must this player do before the turn ends?" — \
+never "should the simulation…" or "does the rulebook allow…". Do not decide \
+who is right; the engine that played the games, the \
 auditor, or the rulebook's wording could each be at fault.
 
 Return ONLY a JSON array: [{{"name": "<auditor name exactly as given>", \
@@ -516,6 +537,11 @@ resources) with the exact numbers; never mention steps, traces, engines or \
 auditors. Also extract, as short values, what the simulation actually did and \
 what the auditor says should have happened.
 
+The "moment in the game record" below is what the simulation was actually \
+doing at the flagged step — its phase and pending action. If it shows the \
+moment was mid-turn (e.g. a discard or payment still pending), the scenario \
+must say so; the auditor may have judged the wrong moment.
+
 Return ONLY a JSON object: {{"scenario": "<2-3 sentences>", "question": "<one \
 factual question, e.g. 'How much food does this family owe?'>", \
 "engine_value": "<what the simulation did, short>", "auditor_value": "<what \
@@ -523,6 +549,9 @@ the auditor expected, short>"}}
 
 === auditor: {name} — {rule} ===
 {findings}
+
+=== moment in the game record ===
+{context}
 """
 
 PROXY_PROMPT = """You are a rules expert. Using ONLY the rulebook below, answer the \
@@ -554,10 +583,11 @@ Expert's answer: {answer}
 """
 
 
-def frame_finding(name: str, rule: str, findings: list[str]) -> dict:
+def frame_finding(name: str, rule: str, findings: list[str], context: str = "") -> dict:
     key = os.environ.get("ANTHROPIC_API_KEY")
     d = _json_obj_call(key, FRAME_PROMPT.format(name=name, rule=rule,
-                                                findings="\n".join(findings[:8])), max_tokens=3000)
+                                                findings="\n".join(findings[:8]),
+                                                context=context or "(not available)"), max_tokens=3000)
     return {k: str(d.get(k, ""))[:600] for k in ("scenario", "question", "engine_value", "auditor_value")}
 
 

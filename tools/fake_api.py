@@ -34,7 +34,18 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("content-length", 0))
         body = json.loads(self.rfile.read(n))
         assert body.get("stream") is True, "client must stream"
-        assert body["output_config"]["effort"] in ("low", "medium", "high"), "effort missing"
+        if body["model"].startswith("claude-haiku"):
+            # the real API rejects effort on Haiku 4.5; the client must not send it
+            if "output_config" in body:
+                self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
+                self.wfile.write(b'{"type":"error","error":{"type":"invalid_request_error","message":"output_config: not supported for this model"}}')
+                return
+        else:
+            assert body["output_config"]["effort"] in ("low", "medium", "high"), "effort missing"
+        if "[SCENARIO:400]" in json.dumps(body):
+            self.send_response(400); self.send_header("content-type", "application/json"); self.end_headers()
+            self.wfile.write(b'{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be <= 64000"}}')
+            return
         assert body["max_tokens"] >= 100
         text = body["messages"][0]["content"]
         # ---- non-engine prompts: review / plan / checker

@@ -222,6 +222,37 @@ def get_project(pid: str):
     return _load(pid)
 
 
+# ======================= clarifications (undoable) ========================
+CLAR_HEADER = "## Clarifications from the designer"
+
+
+def _rebuild_clarifications(pid: str, meta: dict) -> None:
+    """The rulebook's clarifications section is always regenerated from the
+    structured store, so removing a record removes its text."""
+    rb = DATA / pid / "rulebook.txt"
+    text = rb.read_text(encoding="utf-8")
+    if CLAR_HEADER in text:
+        text = text[:text.index(CLAR_HEADER)].rstrip()
+    recs = meta.get("clarifications_store", [])
+    if recs:
+        text += "\n\n" + CLAR_HEADER + "\n"
+        for r in recs:
+            text += f"- {r['question']}\n  Designer: {r['answer']}\n"
+    rb.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def _set_clarification(pid: str, meta: dict, key: str, question: str, answer: str) -> None:
+    store = [r for r in meta.get("clarifications_store", []) if r["key"] != key]
+    store.append({"key": key, "question": question, "answer": answer, "time": time.time()})
+    meta["clarifications_store"] = store
+    _rebuild_clarifications(pid, meta)
+
+
+def _drop_clarification(pid: str, meta: dict, key: str) -> None:
+    meta["clarifications_store"] = [r for r in meta.get("clarifications_store", []) if r["key"] != key]
+    _rebuild_clarifications(pid, meta)
+
+
 # ============================ rules workshop ==============================
 def _readiness(ws: dict) -> int:
     items = ws.get("items", [])
@@ -338,13 +369,23 @@ def workshop_answer(pid: str, req: WorkshopAnswer):
         it["status"] = "answered"; it["answer"] = req.answer.strip()
     else:
         raise HTTPException(400, "type an answer or confirm the assumption")
-    rb = DATA / pid / "rulebook.txt"
-    text = rb.read_text(encoding="utf-8").rstrip()
-    if "## Clarifications from the designer" not in text:
-        text += "\n\n## Clarifications from the designer\n"
     q = it["text"] if it["source"] == "review" else (it["assumption"] or it["text"])
-    text += f"- {q}\n  Designer: {it['answer']}\n"
-    rb.write_text(text + "\n", encoding="utf-8")
+    _set_clarification(pid, meta, f"ws:{it['id']}", q, it["answer"])
+    ws["readiness"] = _readiness(ws)
+    meta["workshop"] = ws
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/undo")
+def workshop_undo(pid: str, req: WorkshopAnswer):
+    """Reopen a settled workshop item and remove its clarification from the rulebook."""
+    meta = _load(pid); ws = meta.get("workshop") or {}
+    it = next((i for i in ws.get("items", []) if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such item")
+    it["status"] = "open"; it["answer"] = ""; it.pop("deferred", None)
+    _drop_clarification(pid, meta, f"ws:{it['id']}")
     ws["readiness"] = _readiness(ws)
     meta["workshop"] = ws
     _save(meta)
@@ -389,12 +430,8 @@ def clarify(pid: str, req: Answers):
     meta = _load(pid)
     rb = DATA / pid / "rulebook.txt"
     answered = [a for a in req.answers if str(a.get("answer", "")).strip()]
-    if answered:
-        text = rb.read_text(encoding="utf-8").rstrip()
-        text += "\n\n## Clarifications from the designer\n"
-        for a in answered:
-            text += f"- Q: {a['question'].strip()}\n  A: {a['answer'].strip()}\n"
-        rb.write_text(text + "\n", encoding="utf-8")
+    for k, a in enumerate(answered):
+        _set_clarification(pid, meta, f"review:{k}:{a['question'][:40]}", a["question"].strip(), a["answer"].strip())
     meta["clarified"] = True
     meta["clarifications"] = len(answered)
     _save(meta)
@@ -432,12 +469,41 @@ def build_checkers(pid: str):
     return job
 
 
+SPECS_BY_SEED = [["random", "random"], ["scoregreedy", "scoregreedy"],
+                 ["random", "random", "random", "random"]]
+
+
+def _moment_context(game, finding: str) -> str:
+    """Re-record the flagged game and describe what the engine was doing at
+    the flagged step: phase, acting player, action. Grounds the jury's framing
+    in the record rather than in the auditor's wording."""
+    import re
+    g = re.search(r"game (\d+)", finding); st = re.search(r"step (\d+)", finding)
+    if not g or not st:
+        return ""
+    seed = int(g.group(1)); step = int(st.group(1))
+    specs = SPECS_BY_SEED[seed % len(SPECS_BY_SEED)]
+    try:
+        tr = record_trace(game, specs, len(specs), 500 + seed)
+        s = tr["steps"][step]
+        nxt = tr["steps"][step + 1] if step + 1 < len(tr["steps"]) else None
+        out = (f"At the flagged step the phase was '{s['phase']}', player {s['player']} was acting, "
+               f"and the action taken was {s['action']}; afterwards the phase was '{s['after'].get('phase', '?')}'.")
+        if nxt:
+            out += (f" The very next step was phase '{nxt['phase']}', player {nxt['player']}, "
+                    f"action {nxt['action']}.")
+        ds = getattr(game, "describe_state", None)
+        return out
+    except Exception as e:
+        return f"(could not re-record the moment: {e})"
+
+
 def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
     checkers = load_checkers(cdir)
     results = {getattr(c, "NAME", c.__checker_file__): {"rule": getattr(c, "RULE", ""),
                "gaps": [], "findings": []} for c in checkers}
-    specs_by_seed = [["random", "random"], ["scoregreedy", "scoregreedy"],
-                     ["random", "random", "random", "random"]]
+    specs_by_seed = SPECS_BY_SEED
+    games_hit = {n: set() for n in results}
     for seed in range(n_games):
         specs = specs_by_seed[seed % len(specs_by_seed)]
         tr = record_trace(game, specs, len(specs), 500 + seed)
@@ -449,10 +515,13 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
                 msgs = [f"CHECKER CRASHED: {type(e).__name__}: {e}"]
             for m in msgs:
                 bucket = "gaps" if m.startswith("SCHEMA GAP") else "findings"
+                if bucket == "findings":
+                    games_hit[name].add(seed)
                 if m not in results[name][bucket]:
                     results[name][bucket].append(m if bucket == "gaps" else f"game {seed}: {m}")
     meta["checkers"] = [{"name": n, "rule": r["rule"], "gaps": r["gaps"][:3],
-                         "findings": r["findings"][:8], "n_findings": len(r["findings"])}
+                         "findings": r["findings"][:8], "n_findings": len(r["findings"]),
+                         "games_hit": len(games_hit[n]), "games_total": n_games}
                         for n, r in results.items()]
     meta["checkers_games"] = n_games
     # plain-language questions for every auditor that found something
@@ -611,7 +680,8 @@ def run_jury(pid: str, j: dict) -> None:
         if not c["n_findings"]:
             continue
         j["detail"] = f"jury: {c['name']}"
-        fr = llm.frame_finding(c["name"], c["rule"], c["findings"])
+        ctx = _moment_context(_engine_for(meta), c["findings"][0]) if c["findings"] else ""
+        fr = llm.frame_finding(c["name"], c["rule"], c["findings"], ctx)
         px = llm.proxy_answer(rulebook, fr["scenario"], fr["question"])
         entry = {"auditor": c["name"], "rule": c["rule"], **fr, "proxy": px, "time": time.time()}
         if px["basis"] == "unclear" or not px["answer"]:
@@ -680,12 +750,8 @@ def inbox_answer(pid: str, req: InboxAnswer):
     if not it:
         raise HTTPException(404, "no such question")
     it["status"] = "answered"; it["answer"] = req.answer.strip()
-    rb = DATA / pid / "rulebook.txt"
-    text = rb.read_text(encoding="utf-8").rstrip()
-    if "## Clarifications from the designer" not in text:
-        text += "\n\n## Clarifications from the designer\n"
-    text += f"- {it['question']} (scenario: {it['scenario']})\n  Designer: {it['answer']}\n"
-    rb.write_text(text + "\n", encoding="utf-8")
+    _set_clarification(pid, meta, f"inbox:{it['id']}",
+                       f"{it['question']} (scenario: {it['scenario']})", it["answer"])
     _save(meta)
     side = llm.compare_answer(it["engine_value"], it["auditor_value"], it["answer"])
     if side == "A":
@@ -711,6 +777,23 @@ def inbox_answer(pid: str, req: InboxAnswer):
 
     _run_in_thread(job, work)
     return {"meta": meta, "job": job}
+
+
+@app.post("/api/projects/{pid}/inbox/undo")
+def inbox_undo(pid: str, req: WorkshopAnswer):
+    """Reopen an inbox question and remove its clarification. If the answer had
+    triggered an engine fix, the previous engine is still in version history."""
+    meta = _load(pid)
+    it = next((i for i in meta.get("inbox", []) if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such question")
+    it["status"] = "open"; it["answer"] = ""
+    fixed = "fixed" in (it.pop("outcome", "") or "")
+    _drop_clarification(pid, meta, f"inbox:{it['id']}")
+    meta["undo_note"] = ("that answer had changed the engine — use the version list to revert it"
+                         if fixed else "")
+    _save(meta)
+    return meta
 
 
 # =============================== the runner ===============================
