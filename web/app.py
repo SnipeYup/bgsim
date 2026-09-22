@@ -379,13 +379,40 @@ def run_workshop(pid: str):
             it.setdefault("status", "open")
             it.setdefault("answer", "")
             it["id"] = f"p{ws['pass'] + 1}-{k}"
+        # carry forward: anything the designer already settled stays settled,
+        # matched by content because the model rephrases between passes
+        import difflib
+        prior = [i for i in ws.get("items", []) if i["status"] in ("confirmed", "answered")]
+        def key(i):
+            return (i.get("text", "") + " " + i.get("assumption", "")).lower()
+        carried = 0
+        for it in items:
+            if it["status"] != "open":
+                continue
+            best, score = None, 0.0
+            for pr in prior:
+                r = difflib.SequenceMatcher(None, key(it), key(pr)).ratio()
+                if r > score:
+                    best, score = pr, r
+            if best and score >= 0.55:
+                it["status"] = best["status"]; it["answer"] = best["answer"]
+                it["clar_key"] = best.get("clar_key", f"ws:{best['id']}")
+                carried += 1
+        # anything settled before that the model no longer raises stays in the
+        # list as settled, so the count and the undo list remain honest
+        seen = {key(i) for i in items}
+        for pr in prior:
+            if not any(difflib.SequenceMatcher(None, key(pr), k).ratio() >= 0.55 for k in seen):
+                pr = dict(pr); pr["id"] = f"p{ws['pass'] + 1}-kept-{pr['id']}"
+                pr.setdefault("clar_key", f"ws:{prior[0]['id']}" if False else pr.get("clar_key", f"ws:{pr['id'].split('-kept-')[-1]}"))
+                items.append(pr)
         ws["pass"] += 1
         ws["items"] = items
         ws["outline"] = restated["outline"]
         ws["cost_table"] = restated["cost_table"]
         ws["walk"] = steps
         ws["history"].append({"pass": ws["pass"], "open": sum(1 for i in items if i["status"] == "open"),
-                              "auto_answered": auto, "cost": llm.cost_note()})
+                              "auto_answered": auto, "carried": carried, "cost": llm.cost_note()})
         ws["readiness"] = _readiness(ws)
         meta["workshop"] = ws
         meta["complexity"] = _complexity(meta)
@@ -429,7 +456,8 @@ def workshop_answer(pid: str, req: WorkshopAnswer):
     else:
         raise HTTPException(400, "type an answer or confirm the assumption")
     q = it["text"] if it["source"] == "review" else (it["assumption"] or it["text"])
-    _set_clarification(pid, meta, f"ws:{it['id']}", q, it["answer"])
+    it.setdefault("clar_key", f"ws:{it['id']}")
+    _set_clarification(pid, meta, it["clar_key"], q, it["answer"])
     ws["readiness"] = _readiness(ws)
     meta["workshop"] = ws
     _save(meta)
@@ -444,7 +472,7 @@ def workshop_undo(pid: str, req: WorkshopAnswer):
     if not it:
         raise HTTPException(404, "no such item")
     it["status"] = "open"; it["answer"] = ""; it.pop("deferred", None)
-    _drop_clarification(pid, meta, f"ws:{it['id']}")
+    _drop_clarification(pid, meta, it.get("clar_key", f"ws:{it['id']}"))
     ws["readiness"] = _readiness(ws)
     meta["workshop"] = ws
     _save(meta)

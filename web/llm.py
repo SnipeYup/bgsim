@@ -293,6 +293,10 @@ Return ONLY a JSON array (no fences, no prose). Each item: \
 answer resolves it>"}}. At most 12 items, most important first. If the \
 rulebook is complete, return [].
 
+If the rulebook ends with a section "Clarifications from the designer", \
+those clarifications are authoritative rulings: anything they settle counts \
+as STATED, and must not be raised again as an assumption, question, or gap.
+
 === rulebook ===
 {rulebook}
 """
@@ -471,6 +475,10 @@ Return ONLY a JSON object: {{"outline": [{{"section": "<name>", "lines": \
 this rests on, or empty>"}}]}}], "cost_table": [{{"action": "<name>", \
 "cost": "<exact>", "effect": "<exact>", "basis": "stated"|"inferred"|"unclear"}}]}}
 
+If the rulebook ends with a section "Clarifications from the designer", \
+those clarifications are authoritative rulings: anything they settle counts \
+as STATED, and must not be raised again as an assumption, question, or gap.
+
 === rulebook ===
 {rulebook}
 """
@@ -482,6 +490,10 @@ to assume something the text does not settle, say so in that step. Keep it to \
 the shortest round that exercises the main actions. Return ONLY a JSON \
 object: {{"steps": [{{"text": "<one step>", "assumption": "<empty, or the \
 assumption this step needed>"}}]}}
+
+If the rulebook ends with a section "Clarifications from the designer", \
+those clarifications are authoritative rulings: anything they settle counts \
+as STATED, and must not be raised again as an assumption, question, or gap.
 
 === rulebook ===
 {rulebook}
