@@ -97,6 +97,9 @@
   .rq input{margin-top:4px}
   .kind{font-size:11px; padding:1px 6px; border-radius:3px; background:var(--felt); color:var(--paper)}
   .kind.missing{background:var(--alert)} .kind.contradiction{background:#7A2E1E}
+  .answers{display:flex; flex-direction:column; gap:6px; margin:6px 0}
+  .ans{text-align:left; font:inherit; font-size:14px; padding:9px 12px; border:1.5px solid var(--felt); border-radius:6px; background:#fff; color:var(--ink); cursor:pointer}
+  .ans:hover{background:#EEF3EF} .ans .tag{display:block; font-size:12px; color:var(--ink-soft); margin-top:3px}
   .decide{margin-top:6px; font-size:13px} .decide summary{cursor:pointer; color:var(--ink-soft)}
   .resolve{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px}
   .resolve .btn{padding:5px 9px; font-size:12.5px}
@@ -322,28 +325,34 @@ function renderCheckers(p){
   const rows = c.map(x=>{
     if(!x.n_findings) return `<div class="qrow pass"><span class="qi">&#10003;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — checked, no problems${x.gaps.length?` <span class="qq" style="display:inline">(couldn't verify part of it: ${esc(x.gaps[0].replace(/^SCHEMA GAP:\s*/,''))})</span>`:''}</span></div>`;
     const q = qs[x.name];
-    const body = q ? `<div class="qq"><b>What the simulation did:</b> ${esc(q.simulation_did||q.what_happened)}<br>
-                     <b>What the auditor expected:</b> ${esc(q.auditor_expected||'(see findings)')}<br>
-                     <b>Your rule it concerns:</b> "${esc(q.rule)}"<br><b>The question:</b> ${esc(q.question)}</div>`
+    const body = q ? `<div class="qq"><b>What the simulated players did:</b> ${esc(q.simulation_did||q.what_happened||'')}<br>
+                     <b>Your rule it concerns:</b> "${esc(q.rule)}"</div>`
                    : `<div class="qq">${x.findings.slice(0,3).map(esc).join('<br>')}</div>`;
     const where = x.games_total ? `seen in ${x.games_hit} of ${x.games_total} games` : `${x.n_findings} finding(s)`;
-    const juried = (p.jury_trail||[]).some(e=>e.auditor===x.name);
+    const verdicts = (p.jury_trail||[]).filter(e=>e.auditor===x.name);
+    const juried = verdicts.length > 0;
     const sid = 'fs-'+x.name;
-    const buttons = juried ? `<div class="resolve">The jury couldn't settle this — the question is in your inbox above.</div>` :
-      `<div class="resolve" id="${sid}-btns"><span class="status" id="${sid}" style="margin:0"></span></div>
-       <details class="decide"><summary>Decide this one yourself (instead of the jury)</summary>
-        <div class="resolve">
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','engine')">The simulation got it wrong → fix the simulation</button>
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','auditor')">The auditor got it wrong → dismiss the auditor</button>
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','rulebook')">My rulebook doesn't say → I'll add a clarification</button>
-        </div>
-        <div class="resolve">Neither is quite right — the correct answer is:
-          <input type="text" id="${sid}-ans" placeholder="e.g. they must discard down to 10 before their turn ends" style="flex:1;min-width:220px">
+    const answers = q && q.answer_if_simulation_right ? `
+        <div class="qq" style="margin-top:8px"><b>The question that decides it:</b> ${esc(q.question)}</div>
+        <div class="answers">
+          <button class="ans" onclick="findingAct('${p.id}','${x.name}','sim_right')">${esc(q.answer_if_simulation_right)}<span class="tag">→ the simulation is right</span></button>
+          <button class="ans" onclick="findingAct('${p.id}','${x.name}','auditor_right')">${esc(q.answer_if_auditor_right)}<span class="tag">→ the auditor is right, fix the simulation</span></button>
+        </div>` : '';
+    const buttons = juried ? `<div class="resolve">Jury: ${esc(verdicts[verdicts.length-1].verdict)}${/queued/.test(verdicts[verdicts.length-1].verdict)?' — see the inbox above.':''}</div>` :
+      `${answers}
+       <div class="resolve" id="${sid}-btns"><span class="status" id="${sid}" style="margin:0"></span></div>
+       <div class="resolve">Neither — the correct rule is:
+          <input type="text" id="${sid}-ans" placeholder="write the rule in your own words" style="flex:1;min-width:220px">
           <button class="btn amber" onclick="findingAct('${p.id}','${x.name}','answer')">Use my answer</button>
-        </div></details>`;
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','rulebook')">My rulebook doesn't cover this</button>
+       </div>
+       <details class="decide"><summary>Just decide without answering</summary><div class="resolve">
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','engine')">Fix the simulation</button>
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','auditor')">Dismiss the auditor</button></div></details>`;
     return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${where}${body}${buttons}</span></div>`;
   }).join('');
   return `<div class="stage"><b>3 · Rule checks</b> — ${c.length} auditor(s) over ${p.checkers_games} games: ${total? total+' finding(s), your call below':'all clean'}${p.fix_rounds?` · ${p.fix_rounds} fix round(s)`:''}${p.needs_regeneration?' · <b>rules changed — rebuild the engine</b>':''}
+    ${rows}
     ${total && !c.every(x=>!x.n_findings || (p.jury_trail||[]).some(e=>e.auditor===x.name)) ? `<p class="resolve"><button class="btn amber" onclick="findingAct('${p.id}','__all__','jury')">Let the jury decide all ${c.filter(x=>x.n_findings).length} finding(s) (one run, ~$${(0.05*c.filter(x=>x.n_findings).length+0.4).toFixed(2)} if a fix is needed)</button> <span class="status" id="fs-__all__" style="margin:0"></span></p>` : ''}
     <p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}')">Re-audit</button></p></div>`;
 }
@@ -361,8 +370,8 @@ async function findingAct(id, name, decision){
     if(decision==='jury'){
       const job = await api('/projects/'+id+'/jury', {}); await watch(job.id, st, 'Jury deliberating'); BUSY=false; open(id); return; }
     const r = await api('/projects/'+id+'/checkers/resolve', {name, decision, note});
-    if(r.id && r.status){ await watch(r.id, st, decision==='engine'?'Fixing the simulation':'Working'); }
-    else { st.className='status ok'; st.textContent = decision==='auditor' ? 'Auditor dismissed.' : 'Clarification added.'; }
+    if(r.id && r.status){ await watch(r.id, st, /engine|auditor_right|answer/.test(decision)?'Fixing the simulation':'Working'); }
+    else { st.className='status ok'; st.textContent = /auditor|sim_right/.test(decision) ? 'Auditor dismissed; your answer was added to the rulebook.' : 'Clarification added.'; }
     BUSY=false; open(id);
   }catch(e){ st.className='status err'; st.textContent=e.message; busy(false); BUSY=false; }
 }

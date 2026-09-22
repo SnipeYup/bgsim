@@ -407,47 +407,51 @@ def write_checker(name: str, section: str, schema: str) -> str:
 
 # ================= plain-language explanations of findings =================
 
-EXPLAIN_PROMPT = """You explain simulation audit results to a board game designer \
-who does not program. Below is the designer's rulebook, then findings from \
-independent auditors (each auditor checks one rule; its findings are terse \
-and technical). For EACH auditor, write one plain-English item: what happened \
-in the simulated games in the designer's own terms (rounds, players, \
-resources — never "step", "trace", "state" or code words), which rule it \
-concerns (quote the rulebook phrase), and a single FACTUAL question about that concrete moment — "with 11 \
-tokens after taking three, what must this player do before the turn ends?" — \
-never "should the simulation…" or "does the rulebook allow…". Do not decide \
-who is right; the engine that played the games, the \
-auditor, or the rulebook's wording could each be at fault.
+EXPLAIN_PROMPT = """You explain a disagreement about a board game's rules to the \
+game's designer, who does not program. For each auditor below you get: the \
+rule it checks, its raw findings (technical — never quote them), and a \
+plain-language replay of the moment in the game it flagged, in the game's own \
+words. From the replay, say what the simulated players did in 1-2 sentences a \
+designer would recognise (turns, gems, food, cards — never "steps", "actions of \
+type", "engine", "state", or code names). Then find the ONE rules question \
+whose answer decides who is right, and write the two candidate answers: the \
+answer under which the simulation behaved correctly, and the answer under \
+which the auditor is correct. Each candidate must be a complete statement of \
+the rule a designer could adopt as written. Do not decide who is right.
 
 Return ONLY a JSON array: [{{"name": "<auditor name exactly as given>", \
-"simulation_did": "<1-2 plain sentences: what the simulated players/engine \
-actually did at that moment, with the numbers>", \
-"auditor_expected": "<1 sentence: what the auditor says should have happened>", \
+"simulation_did": "<1-2 sentences from the replay>", \
 "rule": "<the rulebook phrase this concerns>", \
-"question": "<one factual question about that moment whose answer settles it>"}}]
+"question": "<the deciding question>", \
+"answer_if_simulation_right": "<complete rule statement>", \
+"answer_if_auditor_right": "<complete rule statement>"}}]
 
 === rulebook ===
 {rulebook}
 
-=== auditor findings ===
+=== auditors ===
 {findings}
 """
 
 
-def explain_findings(rulebook: str, findings: dict[str, list[str]]) -> list[dict]:
+def explain_findings(rulebook: str, findings: dict[str, list[str]],
+                     moments: dict[str, str] | None = None) -> dict:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
-    blob = "\n".join(f"[{n}]\n" + "\n".join(f"  {m}" for m in msgs[:6])
-                     for n, msgs in findings.items())
+    moments = moments or {}
+    blob = "\n\n".join(
+        f"[{n}]\nraw findings (do not quote):\n" + "\n".join(f"  {m}" for m in msgs[:6]) +
+        "\nreplay of the flagged moment:\n" + (moments.get(n) or "  (replay unavailable)")
+        for n, msgs in findings.items())
     items = _json_call(key, EXPLAIN_PROMPT.format(rulebook=rulebook[:60_000], findings=blob),
                        max_tokens=6000)
     out = {}
     for it in items:
         if isinstance(it, dict) and it.get("name") in findings:
             out[it["name"]] = {k: str(it.get(k, ""))[:800]
-                               for k in ("simulation_did", "auditor_expected", "rule", "question")}
-            out[it["name"]]["what_happened"] = out[it["name"]]["simulation_did"]  # back-compat
+                               for k in ("simulation_did", "rule", "question",
+                                         "answer_if_simulation_right", "answer_if_auditor_right")}
     return out
 
 

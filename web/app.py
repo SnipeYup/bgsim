@@ -532,6 +532,36 @@ SPECS_BY_SEED = [["random", "random"], ["scoregreedy", "scoregreedy"],
                  ["random", "random", "random", "random"]]
 
 
+def _narrate_moment(game, finding: str, before: int = 4, after: int = 2) -> str:
+    """Replay the flagged game and narrate the steps around the flagged one in
+    the engine's own plain-language voice (describe_state / describe_action).
+    This is what the designer reads, so it must contain no code terms."""
+    import re
+    g = re.search(r"game (\d+)", finding); st = re.search(r"step (\d+)", finding)
+    if not g or not st:
+        return ""
+    seed = int(g.group(1)); step = int(st.group(1))
+    specs = SPECS_BY_SEED[seed % len(SPECS_BY_SEED)]
+    ds = getattr(game, "describe_state", None); da = getattr(game, "describe_action", None)
+    if not (ds and da):
+        return ""
+    try:
+        agents = [make_agent(sp, (500 + seed) * 100 + i) for i, sp in enumerate(specs)]
+        state = game.initial_state(len(specs), 500 + seed)
+        lines, i = [], 0
+        while not game.is_terminal(state) and i <= step + after:
+            p = game.current_player(state)
+            action = agents[p].act(game, state, p)
+            if i >= step - before:
+                mark = "  <-- the flagged moment" if i == step else ""
+                lines.append(f"{ds(state)}\n   Player {p + 1}: {da(state, action)}{mark}")
+            state = game.apply(state, action)
+            i += 1
+        return "\n".join(lines)
+    except Exception as e:
+        return f"(could not replay the moment: {e})"
+
+
 def _moment_context(game, finding: str) -> str:
     """Re-record the flagged game and describe what the engine was doing at
     the flagged step: phase, acting player, action. Grounds the jury's framing
@@ -590,8 +620,9 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
         rb = DATA / meta["id"] / "rulebook.txt"
         if rb.exists():
             try:
+                moments = {n: _narrate_moment(game, f[0]) for n, f in with_findings.items()}
                 meta["checker_questions"] = llm.explain_findings(
-                    rb.read_text(encoding="utf-8"), with_findings)
+                    rb.read_text(encoding="utf-8"), with_findings, moments)
             except Exception as e:  # explanations are a convenience, never a blocker
                 meta["checker_questions"] = {"_error": str(e)}
     else:
@@ -629,6 +660,13 @@ def resolve_finding(pid: str, req: Resolution):
     if not entry:
         raise HTTPException(404, "no such auditor")
     cdir = DATA / pid / "checkers"
+    q = meta.get("checker_questions", {}).get(req.name, {})
+    if req.decision in ("sim_right", "auditor_right"):
+        chosen = q.get("answer_if_simulation_right" if req.decision == "sim_right" else "answer_if_auditor_right", "")
+        if q.get("question") and chosen:
+            _set_clarification(pid, meta, f"finding:{req.name}", q["question"], chosen)
+            _save(meta)
+        req.decision = "auditor" if req.decision == "sim_right" else "engine"
     if req.decision == "auditor":
         # retire the auditor: rename so load_checkers skips it
         f = cdir / f"{req.name}.py"

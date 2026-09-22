@@ -82,12 +82,15 @@ class H(BaseHTTPRequestHandler):
                  "question": "May a player take fewer than 3 different tokens by choice?"},
                 {"kind": "missing", "quote": "End of the game",
                  "question": "If two players tie on points and card count, who wins?"}]))
-        if "explain simulation audit results" in text:
+        if "You explain a disagreement about a board game" in text:
             import re
-            names = re.findall(r"^\[(\w+)\]", text.split("=== auditor findings ===")[1], re.M)
+            names = re.findall(r"^\[(\w+)\]", text.split("=== auditors ===")[1], re.M)
             return self._stream_text(json.dumps([{
-                "name": n, "what_happened": f"In several games a rule about {n} was applied differently from the rulebook.",
-                "rule": "the relevant rulebook phrase", "question": f"Is the engine's handling of {n} correct?"} for n in names]))
+                "name": n, "simulation_did": "Turn 13: Player 2 took three gems and, holding 11, returned one to the supply before the turn passed.",
+                "rule": "You may never end your turn with more than 10 tokens.",
+                "question": "Is returning excess gems down to 10 a step within the turn, or an extra action?",
+                "answer_if_simulation_right": "Returning excess gems is a step of the turn: after your action you must return gems until you hold 10.",
+                "answer_if_auditor_right": "Nothing beyond the four actions may happen on a turn; a player may never hold more than 10 gems at any point."} for n in names]))
         if "Split the rulebook below into" in text:
             return self._stream_text(json.dumps([
                 {"name": "turn_order", "text": "Players take turns in order. Each turn one action."},
