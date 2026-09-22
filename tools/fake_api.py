@@ -72,7 +72,8 @@ class H(BaseHTTPRequestHandler):
         if "narrate one complete sample round of play" in text:
             return self._stream_text(json.dumps({"steps": [
                 {"text": "Player 1 takes 3 wood from the Forest.", "assumption": ""},
-                {"text": "Player 2 plows a field next to their house.", "assumption": "fields need not be adjacent to the house"}]}))
+                {"text": "Player 2 plows a field next to their house.", "rule_gap": "whether the first field must be adjacent to the house"},
+                {"text": "Player 1 takes white, blue and green gems.", "rule_gap": ""}]}))
         if "decide whether the rulebook text actually" in text:
             n = text.split("=== questions ===")[1].count("\n")
             return self._stream_text(json.dumps([{"answered": True, "answer": "Exactly three; the text says 'three different colours'.", "quote": "three gem tokens of different colours"}] + [{"answered": False, "answer": "", "quote": ""}] * max(0, n - 1)))

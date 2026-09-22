@@ -379,10 +379,16 @@ def run_workshop(pid: str):
             it.setdefault("status", "open")
             it.setdefault("answer", "")
             it["id"] = f"p{ws['pass'] + 1}-{k}"
+        # example choices that slipped through the prompt are not rules questions
+        junk = ("chose", "arbitrarily", "specifically", "assumed the existence", "example card",
+                "exact card", "picked", "since any combination", "since any colour")
+        for it in items:
+            if it["source"] == "sample round" and any(w in it["assumption"].lower() for w in junk):
+                it["status"] = "dismissed"; it["answer"] = "(example choice, not a rule)"
         # carry forward: anything the designer already settled stays settled,
         # matched by content because the model rephrases between passes
         import difflib
-        prior = [i for i in ws.get("items", []) if i["status"] in ("confirmed", "answered")]
+        prior = [i for i in ws.get("items", []) if i["status"] in ("confirmed", "answered", "dismissed")]
         def key(i):
             return (i.get("text", "") + " " + i.get("assumption", "")).lower()
         carried = 0
@@ -474,6 +480,31 @@ def workshop_undo(pid: str, req: WorkshopAnswer):
     it["status"] = "open"; it["answer"] = ""; it.pop("deferred", None)
     _drop_clarification(pid, meta, it.get("clar_key", f"ws:{it['id']}"))
     ws["readiness"] = _readiness(ws)
+    meta["workshop"] = ws
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/dismiss")
+def workshop_dismiss(pid: str, req: WorkshopAnswer):
+    """'Not a rules question' — settles the item without a clarification."""
+    meta = _load(pid); ws = meta.get("workshop") or {}
+    it = next((i for i in ws.get("items", []) if i["id"] == req.item_id), None)
+    if not it:
+        raise HTTPException(404, "no such item")
+    it["status"] = "dismissed"; it["answer"] = "(not a rules question)"; it.pop("deferred", None)
+    ws["readiness"] = _readiness(ws)
+    meta["workshop"] = ws
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/reset-passes")
+def workshop_reset_passes(pid: str):
+    if not DEV_MODE:
+        raise HTTPException(403, "disabled in production")
+    meta = _load(pid); ws = meta.get("workshop") or {}
+    ws["pass"] = 0
     meta["workshop"] = ws
     _save(meta)
     return meta

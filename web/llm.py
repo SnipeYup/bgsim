@@ -485,11 +485,19 @@ as STATED, and must not be raised again as an assumption, question, or gap.
 
 WALK_PROMPT = """From the rulebook below, narrate one complete sample round of play \
 for {n} players, in plain language, as a rules expert would when teaching the \
-game: who acts, what they do, what it costs, what changes. Whenever you have \
-to assume something the text does not settle, say so in that step. Keep it to \
-the shortest round that exercises the main actions. Return ONLY a JSON \
-object: {{"steps": [{{"text": "<one step>", "assumption": "<empty, or the \
-assumption this step needed>"}}]}}
+game: who acts, what they do, what it costs, what changes. Keep it to the \
+shortest round that exercises the main actions.
+
+For each step, report a "rule_gap" ONLY when the step needed a RULE the text \
+does not settle — e.g. whether a limit is checked before or after an action, \
+what happens when a supply is empty, whether two effects stack. Choosing which \
+legal option a player takes, which colour or card they pick, or inventing an \
+example card's cost is NOT a gap: it is your example, and rule_gap must be \
+empty. A gap must be phrased as the missing rule, not as a description of your \
+choice.
+
+Return ONLY a JSON object: {{"steps": [{{"text": "<one step>", "rule_gap": "<empty, \
+or the rule the text does not settle>"}}]}}
 
 If the rulebook ends with a section "Clarifications from the designer", \
 those clarifications are authoritative rulings: anything they settle counts \
@@ -547,7 +555,8 @@ def walk_turn(rulebook: str, n_players: int = 2) -> list[dict]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     data = _json_obj_call(key, WALK_PROMPT.format(rulebook=rulebook[:120_000], n=n_players),
                           max_tokens=8000, role="audit")
-    return [{"text": str(s.get("text", ""))[:500], "assumption": str(s.get("assumption", ""))[:400]}
+    return [{"text": str(s.get("text", ""))[:500],
+             "assumption": str(s.get("rule_gap", s.get("assumption", "")))[:400]}
             for s in data.get("steps", []) if isinstance(s, dict) and s.get("text")]
 
 

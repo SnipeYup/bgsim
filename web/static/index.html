@@ -281,16 +281,18 @@ function renderWorkshop(p){
         <input type="text" id="ws-${i.id}" placeholder="${i.assumption?'or correct it in your words':'your answer'}" style="flex:1;min-width:180px">
         <button class="btn amber" onclick="wsAnswer('${p.id}','${i.id}',$('#ws-${i.id}').value,false)">Save</button>
         <button class="btn" onclick="wsSkip('${p.id}','${i.id}')">Not sure</button>
+        <button class="btn" onclick="wsDismiss('${p.id}','${i.id}')" title="Settles it without adding anything to your rulebook">Not a rules question</button>
       </div></div>`;
   return `<div class="stage"><b>Rules workshop</b> — pass ${ws.pass} of ${5} · readiness <b>${ws.readiness}%</b>${meter}
-    <div class="qq">${ws.items.length} places the model wasn't certain · ${auto} answered from your own text · ${ws.items.length-open.length-auto} settled by you · ${open.length} open</div>
+    <div class="qq">${ws.items.length} places the model wasn't certain · ${auto} answered from your own text · ${ws.items.filter(i=>i.status==='confirmed'||i.status==='answered').length} settled by you · ${ws.items.filter(i=>i.status==='dismissed').length} not rules questions · ${open.length} open</div>
     ${shown.length ? shown.map(itemHtml).join('') : (open.length ? '' : '<p class="status ok">Nothing open. Your rules are ready.</p>')}
     ${deferred.length?`<details><summary>${deferred.length} set aside as "not sure"</summary>${deferred.map(itemHtml).join('')}</details>`:''}
-    ${(()=>{ const done = ws.items.filter(i=>i.status==='confirmed'||i.status==='answered'); return done.length?`<details><summary>${done.length} settled by you</summary>${done.map(i=>`<div class="qq">${esc(i.text)} → <b>${esc(i.answer)}</b> <button class="btn" style="padding:2px 7px;font-size:11px" onclick="wsUndo('${p.id}','${i.id}')">Undo</button></div>`).join('')}</details>`:''; })()}
+    ${(()=>{ const done = ws.items.filter(i=>i.status==='confirmed'||i.status==='answered'||i.status==='dismissed'); return done.length?`<details><summary>${done.length} settled by you</summary>${done.map(i=>`<div class="qq">${esc(i.text)} → <b>${esc(i.answer)}</b> <button class="btn" style="padding:2px 7px;font-size:11px" onclick="wsUndo('${p.id}','${i.id}')">Undo</button></div>`).join('')}</details>`:''; })()}
     <details><summary>Cost table as the model reads it (${ws.cost_table.length} actions)</summary><table class="ct">${ws.cost_table.map(r=>`<tr class="${r.basis}"><td>${esc(r.action)}</td><td>${esc(r.cost)}</td><td>${esc(r.effect)}</td><td class="basis">${r.basis}</td></tr>`).join('')}</table></details>
     <details><summary>A sample round, as the model would play it</summary><ol>${ws.walk.map(s=>`<li>${esc(s.text)}${s.assumption?` <i class="asm">(assumed: ${esc(s.assumption)})</i>`:''}</li>`).join('')}</ol></details>
     <details><summary>Full outline (${ws.outline.reduce((n,s)=>n+s.lines.length,0)} lines — you don't need to read this)</summary>${ws.outline.map(s=>`<b>${esc(s.section)}</b><ul>${s.lines.map(l=>`<li class="${l.basis}">${esc(l.text)}</li>`).join('')}</ul>`).join('')}</details>
-    <p>${ws.pass<5?`<button class="btn" onclick="runWorkshop('${p.id}', this)">Re-review with my answers (~$0.15)</button>`:'<span class="status err">All 5 passes used — remaining open items usually mean the rulebook needs an edit.</span>'}</p></div>`;
+    <p>${ws.pass<5?`<button class="btn" onclick="runWorkshop('${p.id}', this)">Re-review with my answers (~$0.15)</button>`:'<span class="status err">All 5 passes used — remaining open items usually mean the rulebook needs an edit.</span>'}
+    ${DEV && ws.pass>=5 ? `<button class="btn" style="padding:4px 8px;font-size:12px" onclick="wsResetPasses('${p.id}')">Reset passes (dev)</button>`:''}</p></div>`;
 }
 async function runWorkshop(id, btn){ await fromButton(btn, 'Workshop', ()=>api('/projects/'+id+'/workshop', {})); }
 async function wsAnswer(id, item, answer, confirm){
@@ -300,6 +302,8 @@ async function wsAnswer(id, item, answer, confirm){
 }
 async function wsUndo(id, item){ await api('/projects/'+id+'/workshop/undo', {item_id:item}); open(id); }
 async function inboxUndo(id, item){ const m = await api('/projects/'+id+'/inbox/undo', {item_id:item}); if(m.undo_note) alert(m.undo_note); open(id); }
+async function wsDismiss(id, item){ await api('/projects/'+id+'/workshop/dismiss', {item_id:item}); open(id); }
+async function wsResetPasses(id){ await api('/projects/'+id+'/workshop/reset-passes', {}); open(id); }
 async function wsSkip(id, item){ await api('/projects/'+id+'/workshop/skip', {item_id:item}); open(id); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 async function runReview(id){
