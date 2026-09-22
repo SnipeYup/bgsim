@@ -615,7 +615,42 @@ def resolve_finding(pid: str, req: Resolution):
 
         _run_in_thread(job, work)
         return job
-    raise HTTPException(400, "decision must be engine, auditor or rulebook")
+    if req.decision == "answer":
+        # the designer states the fact; the app works out who was wrong
+        if not req.note.strip():
+            raise HTTPException(400, "write the answer first")
+        job = _job("resolve_answer", pid)
+
+        def work(j):
+            m = _load(pid)
+            game = _engine_for(m)
+            ctx = _moment_context(game, entry["findings"][0]) if entry["findings"] else ""
+            j["detail"] = "reading the moment"
+            fr = llm.frame_finding(req.name, entry["rule"], entry["findings"], ctx)
+            j["detail"] = "comparing your answer"
+            side = llm.compare_answer(fr["engine_value"], fr["auditor_value"], req.note)
+            _set_clarification(pid, m, f"finding:{req.name}", f"{fr['question']} (scenario: {fr['scenario']})", req.note.strip())
+            if side == "A":
+                f = cdir / f"{req.name}.py"
+                if f.exists():
+                    f.rename(cdir / f"_{req.name}.py")
+                m["checkers"] = [c for c in m["checkers"] if c["name"] != req.name]
+                m.setdefault("retired_auditors", []).append(req.name)
+                m.setdefault("jury_trail", []).append({"auditor": req.name, "verdict": "designer's answer matches the simulation — auditor dismissed", "time": time.time()})
+                _save(m)
+                return
+            _save(m)
+            reason = (f"The designer has stated the rule for this scenario. Scenario: {fr['scenario']} "
+                      f"Question: {fr['question']} Designer's answer: {req.note.strip()}. "
+                      f"The engine currently does: {fr['engine_value']}.")
+            _repair_and_reaudit(pid, m, j, reason, entry["findings"], f"designer answer: {req.name}")
+            m = _load(pid)
+            m.setdefault("jury_trail", []).append({"auditor": req.name, "verdict": "designer's answer overrode the simulation — fixed", "time": time.time()})
+            _save(m)
+
+        _run_in_thread(job, work)
+        return job
+    raise HTTPException(400, "decision must be engine, auditor, rulebook or answer")
 
 
 @app.get("/api/projects/{pid}/versions")

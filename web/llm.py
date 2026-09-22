@@ -400,9 +400,11 @@ who is right; the engine that played the games, the \
 auditor, or the rulebook's wording could each be at fault.
 
 Return ONLY a JSON array: [{{"name": "<auditor name exactly as given>", \
-"what_happened": "<2-3 plain sentences with the concrete numbers>", \
+"simulation_did": "<1-2 plain sentences: what the simulated players/engine \
+actually did at that moment, with the numbers>", \
+"auditor_expected": "<1 sentence: what the auditor says should have happened>", \
 "rule": "<the rulebook phrase this concerns>", \
-"question": "<one question whose answer settles it>"}}]
+"question": "<one factual question about that moment whose answer settles it>"}}]
 
 === rulebook ===
 {rulebook}
@@ -424,7 +426,8 @@ def explain_findings(rulebook: str, findings: dict[str, list[str]]) -> list[dict
     for it in items:
         if isinstance(it, dict) and it.get("name") in findings:
             out[it["name"]] = {k: str(it.get(k, ""))[:800]
-                               for k in ("what_happened", "rule", "question")}
+                               for k in ("simulation_did", "auditor_expected", "rule", "question")}
+            out[it["name"]]["what_happened"] = out[it["name"]]["simulation_did"]  # back-compat
     return out
 
 

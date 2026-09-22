@@ -97,6 +97,7 @@
   .rq input{margin-top:4px}
   .kind{font-size:11px; padding:1px 6px; border-radius:3px; background:var(--felt); color:var(--paper)}
   .kind.missing{background:var(--alert)} .kind.contradiction{background:#7A2E1E}
+  .decide{margin-top:6px; font-size:13px} .decide summary{cursor:pointer; color:var(--ink-soft)}
   .resolve{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px}
   .resolve .btn{padding:5px 9px; font-size:12.5px}
   .versions{font-size:13px; color:var(--ink-soft); margin:6px 0}
@@ -319,20 +320,48 @@ function renderCheckers(p){
   const rows = c.map(x=>{
     if(!x.n_findings) return `<div class="qrow pass"><span class="qi">&#10003;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — checked, no problems${x.gaps.length?` <span class="qq" style="display:inline">(couldn't verify part of it: ${esc(x.gaps[0].replace(/^SCHEMA GAP:\s*/,''))})</span>`:''}</span></div>`;
     const q = qs[x.name];
-    const body = q ? `<div class="qq"><b>What happened:</b> ${esc(q.what_happened)}<br><b>Rule:</b> "${esc(q.rule)}"<br><b>Question:</b> ${esc(q.question)}</div>`
+    const body = q ? `<div class="qq"><b>What the simulation did:</b> ${esc(q.simulation_did||q.what_happened)}<br>
+                     <b>What the auditor expected:</b> ${esc(q.auditor_expected||'(see findings)')}<br>
+                     <b>Your rule it concerns:</b> "${esc(q.rule)}"<br><b>The question:</b> ${esc(q.question)}</div>`
                    : `<div class="qq">${x.findings.slice(0,3).map(esc).join('<br>')}</div>`;
     const where = x.games_total ? `seen in ${x.games_hit} of ${x.games_total} games` : `${x.n_findings} finding(s)`;
     const juried = (p.jury_trail||[]).some(e=>e.auditor===x.name);
-    const buttons = juried ? `<div class="resolve">The jury couldn't settle this — see the inbox for the question.</div>` :
-      `<div class="resolve"><button class="btn amber" onclick="runJury('${p.id}')">Send to the jury (automatic, ~$0.05 per finding)</button>
-        <details style="display:inline"><summary style="cursor:pointer;font-size:12.5px">or decide it yourself</summary>
-        <button class="btn" onclick="resolve('${p.id}','${x.name}','engine')">Simulation is wrong — fix it</button>
-        <button class="btn" onclick="resolve('${p.id}','${x.name}','auditor')">Auditor misread — ignore it</button>
-        <button class="btn" onclick="resolveRulebook('${p.id}','${x.name}')">Rules unclear — clarify</button></details></div>`;
+    const sid = 'fs-'+x.name;
+    const buttons = juried ? `<div class="resolve">The jury couldn't settle this — the question is in your inbox above.</div>` :
+      `<div class="resolve" id="${sid}-btns">
+        <button class="btn amber" onclick="findingAct('${p.id}','${x.name}','jury')">Let the jury decide (automatic, ~5¢)</button>
+        <span class="status" id="${sid}" style="margin:0"></span></div>
+       <details class="decide"><summary>Or decide it yourself</summary>
+        <div class="resolve">
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','engine')">The simulation got it wrong → fix the simulation</button>
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','auditor')">The auditor got it wrong → dismiss the auditor</button>
+          <button class="btn" onclick="findingAct('${p.id}','${x.name}','rulebook')">My rulebook doesn't say → I'll add a clarification</button>
+        </div>
+        <div class="resolve">Neither is quite right — the correct answer is:
+          <input type="text" id="${sid}-ans" placeholder="e.g. they must discard down to 10 before their turn ends" style="flex:1;min-width:220px">
+          <button class="btn amber" onclick="findingAct('${p.id}','${x.name}','answer')">Use my answer</button>
+        </div></details>`;
     return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${where}${body}${buttons}</span></div>`;
   }).join('');
   return `<div class="stage"><b>3 · Rule checks</b> — ${c.length} auditor(s) over ${p.checkers_games} games: ${total? total+' finding(s), your call below':'all clean'}${p.fix_rounds?` · ${p.fix_rounds} fix round(s)`:''}${p.needs_regeneration?' · <b>rules changed — rebuild the engine</b>':''}
     ${rows}<p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}')">Re-audit</button></p></div>`;
+}
+async function findingAct(id, name, decision){
+  const st = document.getElementById('fs-'+name);
+  const row = st ? st.closest('.qrow') : null;
+  const busy = on => { if(row) row.querySelectorAll('button').forEach(b=>b.disabled=on); };
+  let note = '';
+  if(decision==='rulebook'){ note = prompt('Write the clarification in your own words — it gets added to your rulebook:'); if(note===null) return; }
+  if(decision==='answer'){ note = document.getElementById('fs-'+name+'-ans').value; if(!note.trim()){ st.textContent='Type the answer first.'; return; } }
+  busy(true);
+  try{
+    if(decision==='jury'){
+      const job = await api('/projects/'+id+'/jury', {}); await watch(job.id, st, 'Jury deliberating'); open(id); return; }
+    const r = await api('/projects/'+id+'/checkers/resolve', {name, decision, note});
+    if(r.id && r.status){ await watch(r.id, st, decision==='engine'?'Fixing the simulation':'Working'); }
+    else { st.className='status ok'; st.textContent = decision==='auditor' ? 'Auditor dismissed.' : 'Clarification added.'; }
+    open(id);
+  }catch(e){ st.className='status err'; st.textContent=e.message; busy(false); }
 }
 async function resolve(id, name, decision, note){
   const st = $('#engstat');
