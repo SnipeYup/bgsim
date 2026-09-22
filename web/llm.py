@@ -29,11 +29,28 @@ ESCALATE = {"claude-sonnet-5": "claude-opus-5", "claude-opus-5": "claude-opus-5"
 EFFORTS = {"light": "medium", "heavy": "high"}
 
 _ctx = threading.local()  # per-thread: tier, project id, spend cap, spend so far
-on_cost = None            # app sets: callable(pid, model, usd) after every call
+on_cost = None            # app sets: callable(pid, model, usd, info) after every call
+_stage = threading.local() # human label for what the current call is for
+
+
+def set_stage(label: str) -> None:
+    _stage.label = label
 
 
 class BudgetExceeded(RuntimeError):
     pass
+
+
+class Cancelled(RuntimeError):
+    pass
+
+
+cancel_check = None  # app sets: callable() -> bool, True when the current job was stopped
+
+
+def _maybe_cancel():
+    if cancel_check and cancel_check():
+        raise Cancelled("stopped by the user")
 
 
 def configure(tier: str = "light", pid: str | None = None, cap_usd: float | None = None,
@@ -78,7 +95,8 @@ def _spend_record(model: str) -> float:
     _ctx.spent = getattr(_ctx, "spent", 0.0) + usd
     if on_cost and getattr(_ctx, "pid", None):
         try:
-            on_cost(_ctx.pid, model, usd)
+            on_cost(_ctx.pid, model, usd, {"in": i, "out": o,
+                                          "stage": getattr(_stage, "label", "?")})
         except Exception:
             pass
     return usd
@@ -118,6 +136,7 @@ def _call_streaming(key: str, body: dict) -> str:
     """Stream the response so the connection never looks idle; assemble the
     text deltas. Returns the full text."""
     body = dict(body, stream=True)
+    _maybe_cancel()
     if not _supports_effort(body.get("model", MODEL)):
         body.pop("output_config", None)
     _spend_check(body.get("model", MODEL))
@@ -135,6 +154,7 @@ def _call_streaming(key: str, body: dict) -> str:
         raise RuntimeError(f"API {e.code} for model {body.get('model')}: {detail}") from None
     with r:
         for raw in r:
+            _maybe_cancel()
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
                 continue

@@ -13,6 +13,7 @@ locally or for yourself only until sandboxing lands.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import json
 import os
 import sys
@@ -71,6 +72,7 @@ def _save(meta: dict) -> None:
     if rec:
         meta["spend_usd"] = rec["usd"]
         meta["spend_by_model"] = rec["by_model"]
+        meta["spend_ledger"] = rec.get("ledger", [])
     _meta_path(meta["id"]).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
@@ -109,21 +111,62 @@ def _write_engine(pid: str, code: str, label: str) -> None:
     _save(meta)
 
 
+MUTATING = {"generate", "checkers", "jury", "fix", "resolve_answer", "second_opinion",
+            "workshop", "run_all"}
+
+
+def _running_for(pid: str):
+    return [j for j in JOBS.values() if j.get("project") == pid and j["status"] == "running"
+            and j.get("kind") in MUTATING]
+
+
 def _job(kind: str, pid: str) -> dict:
-    j = {"id": uuid.uuid4().hex[:10], "kind": kind, "project": pid,
-         "status": "running", "started": time.time(), "detail": "", "error": None}
+    if kind in MUTATING:
+        busy = _running_for(pid)
+        if busy:
+            b = busy[0]
+            raise HTTPException(409, f"'{b['kind']}' is already running on this game "
+                                     f"({b.get('detail') or 'working'}); wait for it to finish")
+    j = _StagedJob({"id": uuid.uuid4().hex[:10], "kind": kind, "project": pid,
+                    "status": "running", "started": time.time(), "detail": "", "error": None})
     JOBS[j["id"]] = j
     return j
 
 
+DEV_MODE = os.environ.get("BGSIM_DEV", "1") != "0"   # production sets BGSIM_DEV=0
+_current = threading.local()
+
+
+def _check_cancel() -> None:
+    j = getattr(_current, "job", None)
+    if j is not None and j.get("cancel"):
+        raise llm.Cancelled("stopped by the user")
+
+
+llm.cancel_check = lambda: bool(getattr(_current, "job", None) and _current.job.get("cancel"))
+
+
+class _StagedJob(dict):
+    """Job dict whose 'detail' updates also label model calls for the ledger."""
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        if k == "detail":
+            llm.set_stage(f"{self.get('kind', '?')}: {v}")
+
+
 def _run_in_thread(job: dict, fn) -> None:
     def wrap():
+        _current.job = job
         try:
             m = _load(job["project"]) if job.get("project") else {}
             cx = m.get("complexity") or {"tier": "light", "budget_usd": BUDGET_USD["light"]}
             llm.configure(cx["tier"], job.get("project"), cx["budget_usd"], m.get("spend_usd", 0.0))
+            llm.set_stage(f"{job.get('kind', '?')}")
             fn(job)
             job["status"] = "done"
+        except llm.Cancelled:
+            job["status"] = "cancelled"
+            job["error"] = "stopped by the user"
         except Exception as e:  # surfaced to the UI, not swallowed
             job["status"] = "error"
             job["error"] = f"{type(e).__name__}: {e}"
@@ -161,10 +204,15 @@ def _complexity(meta: dict) -> dict:
 SPEND: dict[str, dict] = {}  # pid -> {"usd": float, "by_model": {...}}; merged into every _save
 
 
-def _record_cost(pid: str, model: str, usd: float) -> None:
-    rec = SPEND.setdefault(pid, {"usd": 0.0, "by_model": {}})
+def _record_cost(pid: str, model: str, usd: float, info: dict | None = None) -> None:
+    rec = SPEND.setdefault(pid, {"usd": 0.0, "by_model": {}, "ledger": []})
     rec["usd"] = round(rec["usd"] + usd, 4)
     rec["by_model"][model] = round(rec["by_model"].get(model, 0.0) + usd, 4)
+    info = info or {}
+    rec.setdefault("ledger", []).append({
+        "time": time.time(), "stage": info.get("stage", "?"), "model": model.replace("claude-", ""),
+        "in": info.get("in", 0), "out": info.get("out", 0), "usd": round(usd, 4)})
+    rec["ledger"] = rec["ledger"][-300:]
 
 
 llm.on_cost = _record_cost
@@ -220,6 +268,17 @@ def create_project(req: NewProject):
 @app.get("/api/projects/{pid}")
 def get_project(pid: str):
     return _load(pid)
+
+
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: str):
+    """Remove a game and everything under it. Refuses while a job is running."""
+    _load(pid)
+    if _running_for(pid):
+        raise HTTPException(409, "a job is running on this game — stop it first")
+    shutil.rmtree(DATA / pid, ignore_errors=True)
+    SPEND.pop(pid, None)
+    return {"deleted": pid}
 
 
 # ======================= clarifications (undoable) ========================
@@ -505,6 +564,7 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
     specs_by_seed = SPECS_BY_SEED
     games_hit = {n: set() for n in results}
     for seed in range(n_games):
+        _check_cancel()
         specs = specs_by_seed[seed % len(specs_by_seed)]
         tr = record_trace(game, specs, len(specs), 500 + seed)
         for c in checkers:
@@ -711,6 +771,7 @@ def run_jury(pid: str, j: dict) -> None:
     trail = meta.get("jury_trail", [])
     inbox = meta.get("inbox", [])
     fixes = 0
+    to_fix = []
     for c in list(meta.get("checkers") or []):
         if not c["n_findings"]:
             continue
@@ -732,12 +793,8 @@ def run_jury(pid: str, j: dict) -> None:
             if side == "B":
                 entry["verdict"] = "auditor + proxy agree the engine is wrong — fixed"
                 trail.append(entry)
+                to_fix.append((c, px))
                 meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
-                meta = _repair_and_reaudit(pid, meta, j, (
-                    "An independent auditor and an independent rules expert (reading the rulebook "
-                    f"only) agree the engine is wrong. Expert: {px['answer']} (\"{px['quote']}\")."),
-                    c["findings"], c["name"])
-                fixes += 1
                 continue
             if side == "A":
                 entry["verdict"] = "proxy sides with the engine — auditor muted"
@@ -755,6 +812,28 @@ def run_jury(pid: str, j: dict) -> None:
                 c["status"] = "undecided"
         trail.append(entry)
         meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
+    if to_fix:
+        # one repair covering every confirmed violation, one validation, one re-audit
+        rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+        code = (DATA / pid / "game.py").read_text(encoding="utf-8")
+        reason = ("Independent auditors and an independent rules expert (reading the rulebook only) "
+                  "agree the engine is wrong on these points; fix ALL of them:\n")
+        for c, px in to_fix:
+            reason += (f"\n[{c['name']}] expert: {px['answer']} (\"{px['quote']}\")\n  " +
+                       "\n  ".join(c["findings"][:6]))
+        j["detail"] = f"fixing the engine for {len(to_fix)} confirmed violation(s)"
+        new_code = llm.repair_engine(rulebook, code, reason)
+        _write_engine(pid, new_code, "fixed: " + ", ".join(c["name"] for c, _ in to_fix))
+        j["detail"] = "re-validating"
+        game = _engine_for(_load(pid))
+        for seed in range(12):
+            play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+        j["detail"] = "re-auditing once"
+        m2 = _load(pid)
+        run_checkers(m2, game, DATA / pid / "checkers")
+        m2["fix_rounds"] = m2.get("fix_rounds", 0) + 1
+        _save(m2)
+        fixes = len(to_fix)
     m = _load(pid)
     m["jury_trail"] = trail; m["inbox"] = inbox; m["jury_fixes"] = m.get("jury_fixes", 0) + fixes
     m["jury_cost"] = llm.cost_note()
@@ -927,6 +1006,7 @@ def generate(pid: str, force: bool = False):
             game = _engine_for(meta)
             for n in (2, 3, 4):
                 for seed in range(12):
+                    _check_cancel()
                     agents = [make_agent("random", seed * 10 + i) for i in range(n)]
                     play_game(game, agents, seed, debug=True)
         except Exception:
@@ -1093,11 +1173,28 @@ def get_report(pid: str):
     return {"markdown": p.read_text(encoding="utf-8")}
 
 
+@app.get("/api/config")
+def config():
+    return {"dev": DEV_MODE}
+
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    if not DEV_MODE:
+        raise HTTPException(403, "stopping jobs is disabled in production")
+    if jid not in JOBS:
+        raise HTTPException(404, "unknown job")
+    JOBS[jid]["cancel"] = True
+    return {"ok": True}
+
+
 @app.get("/api/jobs/{jid}")
 def job_status(jid: str):
     if jid not in JOBS:
         raise HTTPException(404, "unknown job")
-    return JOBS[jid]
+    j = dict(JOBS[jid])
+    j["elapsed"] = round(time.time() - j["started"], 1)
+    return j
 
 
 @app.get("/")

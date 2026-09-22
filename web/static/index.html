@@ -136,11 +136,12 @@
 
 <script>
 const $ = (s)=>document.querySelector(s);
-let projects=[], current=null;
+let projects=[], current=null, DEV=false;
+fetch('/api/config').then(r=>r.json()).then(c=>{DEV=!!c.dev;}).catch(()=>{});
 
-async function api(path, opts){
-  const r = await fetch('/api'+path, opts && {method:'POST',
-    headers:{'content-type':'application/json'}, body:JSON.stringify(opts)});
+async function api(path, opts, method){
+  const r = await fetch('/api'+path, (opts||method) && {method: method || 'POST',
+    headers:{'content-type':'application/json'}, body: opts ? JSON.stringify(opts) : undefined});
   const data = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.detail || r.statusText);
   return data;
@@ -209,9 +210,10 @@ function refresh0(p){
   const canRun = p.builtin || p.engine==='generated';
   $('#main').innerHTML = `
   <div class="sheet">
-    <h2 class="display" style="margin:0">${p.name}</h2>
+    <h2 class="display" style="margin:0">${p.name} <button class="btn" style="padding:3px 9px;font-size:12px;background:var(--alert);vertical-align:middle" onclick="deleteProject('${p.id}','${esc(p.name).replace(/'/g,"\\'")}')">Delete game</button></h2>
     ${p.complexity ? `<p class="status">${p.complexity.tier==='heavy'?'Heavy game':'Light game'} (score ${p.complexity.score}: ${p.complexity.words.toLocaleString()} words, ${p.complexity.actions} actions) · model spend $${(p.spend_usd||0).toFixed(2)} of $${p.complexity.budget_usd.toFixed(0)} budget
       <button class="btn" style="padding:2px 7px;font-size:11px;margin-left:6px" onclick="setBudget('${p.id}',${p.complexity.budget_usd})">change</button></p>` : (p.spend_usd?`<p class="status">model spend $${p.spend_usd.toFixed(2)}</p>`:'')}
+    ${renderSpend(p)}
     <p class="status" id="engstat">${
       p.builtin ? 'Engine: built-in '+p.builtin :
       p.engine==='generated' ? 'Engine: generated · '+(p.validation||'') :
@@ -328,10 +330,8 @@ function renderCheckers(p){
     const juried = (p.jury_trail||[]).some(e=>e.auditor===x.name);
     const sid = 'fs-'+x.name;
     const buttons = juried ? `<div class="resolve">The jury couldn't settle this — the question is in your inbox above.</div>` :
-      `<div class="resolve" id="${sid}-btns">
-        <button class="btn amber" onclick="findingAct('${p.id}','${x.name}','jury')">Let the jury decide (automatic, ~5¢)</button>
-        <span class="status" id="${sid}" style="margin:0"></span></div>
-       <details class="decide"><summary>Or decide it yourself</summary>
+      `<div class="resolve" id="${sid}-btns"><span class="status" id="${sid}" style="margin:0"></span></div>
+       <details class="decide"><summary>Decide this one yourself (instead of the jury)</summary>
         <div class="resolve">
           <button class="btn" onclick="findingAct('${p.id}','${x.name}','engine')">The simulation got it wrong → fix the simulation</button>
           <button class="btn" onclick="findingAct('${p.id}','${x.name}','auditor')">The auditor got it wrong → dismiss the auditor</button>
@@ -344,24 +344,27 @@ function renderCheckers(p){
     return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${where}${body}${buttons}</span></div>`;
   }).join('');
   return `<div class="stage"><b>3 · Rule checks</b> — ${c.length} auditor(s) over ${p.checkers_games} games: ${total? total+' finding(s), your call below':'all clean'}${p.fix_rounds?` · ${p.fix_rounds} fix round(s)`:''}${p.needs_regeneration?' · <b>rules changed — rebuild the engine</b>':''}
-    ${rows}<p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}')">Re-audit</button></p></div>`;
+    ${total && !c.every(x=>!x.n_findings || (p.jury_trail||[]).some(e=>e.auditor===x.name)) ? `<p class="resolve"><button class="btn amber" onclick="findingAct('${p.id}','__all__','jury')">Let the jury decide all ${c.filter(x=>x.n_findings).length} finding(s) (one run, ~$${(0.05*c.filter(x=>x.n_findings).length+0.4).toFixed(2)} if a fix is needed)</button> <span class="status" id="fs-__all__" style="margin:0"></span></p>` : ''}
+    <p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}')">Re-audit</button></p></div>`;
 }
+let BUSY = false;
 async function findingAct(id, name, decision){
+  if(BUSY){ alert('Something is already running on this game — wait for it to finish.'); return; }
   const st = document.getElementById('fs-'+name);
   const row = st ? st.closest('.qrow') : null;
   const busy = on => { if(row) row.querySelectorAll('button').forEach(b=>b.disabled=on); };
   let note = '';
   if(decision==='rulebook'){ note = prompt('Write the clarification in your own words — it gets added to your rulebook:'); if(note===null) return; }
   if(decision==='answer'){ note = document.getElementById('fs-'+name+'-ans').value; if(!note.trim()){ st.textContent='Type the answer first.'; return; } }
-  busy(true);
+  busy(true); BUSY = true;
   try{
     if(decision==='jury'){
-      const job = await api('/projects/'+id+'/jury', {}); await watch(job.id, st, 'Jury deliberating'); open(id); return; }
+      const job = await api('/projects/'+id+'/jury', {}); await watch(job.id, st, 'Jury deliberating'); BUSY=false; open(id); return; }
     const r = await api('/projects/'+id+'/checkers/resolve', {name, decision, note});
     if(r.id && r.status){ await watch(r.id, st, decision==='engine'?'Fixing the simulation':'Working'); }
     else { st.className='status ok'; st.textContent = decision==='auditor' ? 'Auditor dismissed.' : 'Clarification added.'; }
-    open(id);
-  }catch(e){ st.className='status err'; st.textContent=e.message; busy(false); }
+    BUSY=false; open(id);
+  }catch(e){ st.className='status err'; st.textContent=e.message; busy(false); BUSY=false; }
 }
 async function resolve(id, name, decision, note){
   const st = $('#engstat');
@@ -408,6 +411,13 @@ async function runAll(id){
   const st = $('#engstat');
   try{ const job = await api('/projects/'+id+'/run-all', {}); await watch(job.id, st, 'Running everything'); open(id); }
   catch(e){ st.className='status err'; st.textContent=e.message; }
+}
+function renderSpend(p){
+  const L = p.spend_ledger||[]; if(!L.length) return '';
+  const byStage = {}; for(const e of L){ const k=e.stage.split(':')[0]; byStage[k]=(byStage[k]||0)+e.usd; }
+  const rows = L.slice().reverse().slice(0,60).map(e=>`<tr><td>${new Date(e.time*1000).toLocaleTimeString()}</td><td>${esc(e.stage)}</td><td>${esc(e.model)}</td><td>${e.in.toLocaleString()} / ${e.out.toLocaleString()}</td><td>$${e.usd.toFixed(3)}</td></tr>`).join('');
+  return `<details class="versions"><summary>Where the money went — ${Object.entries(byStage).map(([k,v])=>`${k} $${v.toFixed(2)}`).join(' · ')}${Object.keys(p.spend_by_model||{}).length?' · by model: '+Object.entries(p.spend_by_model).map(([k,v])=>`${k.replace('claude-','')} $${v.toFixed(2)}`).join(', '):''}</summary>
+    <table class="ct"><tr><th>time</th><th>stage</th><th>model</th><th>tokens in / out</th><th>cost</th></tr>${rows}</table></details>`;
 }
 function renderVersions(p){
   const v = p.versions || [];
@@ -491,13 +501,21 @@ async function runSim(id){
   }catch(e){ st.className='status err'; st.textContent=e.message; }
 }
 
+async function deleteProject(id, name){
+  if(!confirm(`Delete "${name}" and everything in it — rulebook, engine, versions, reports? This can't be undone.`)) return;
+  try{ await api('/projects/'+id, null, 'DELETE'); current=null; refresh(); }
+  catch(e){ alert(e.message); }
+}
+async function stopJob(jid){ try{ await api('/jobs/'+jid+'/cancel', {}); }catch(e){ alert(e.message); } }
 async function watch(jid, el, verb){
   for(;;){
     const j = await api('/jobs/'+jid);
     if(j.status==='running'){
       el.className='status';
-      el.innerHTML = `<span class="spin"></span>${verb}… ${j.detail||''}`;
+      el.innerHTML = `<span class="spin"></span>${verb}… ${j.detail||''} <span style="opacity:.6">(${Math.floor((j.elapsed||0)/60)}m ${Math.floor((j.elapsed||0)%60)}s)</span>`
+        + (DEV ? ` <button class="btn" style="padding:2px 8px;font-size:11px;background:var(--alert)" onclick="stopJob('${jid}')">Stop</button>` : '');
       await new Promise(r=>setTimeout(r, 900));
+    } else if(j.status==='cancelled'){ throw new Error('Stopped.');
     } else if(j.status==='error'){
       const err = new Error(j.error); err.trace = j.trace; throw err;
     } else return j;
