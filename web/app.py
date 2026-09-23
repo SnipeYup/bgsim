@@ -13,6 +13,7 @@ locally or for yourself only until sandboxing lands.
 from __future__ import annotations
 
 import importlib.util
+import re
 import shutil
 import json
 import os
@@ -328,13 +329,123 @@ def _drop_clarification(pid: str, meta: dict, key: str) -> None:
     _rebuild_clarifications(pid, meta)
 
 
+# ============================ component data ===============================
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "component"
+
+
+def _component_section(pid: str) -> str:
+    """The 'Component data' section appended to the rulebook for every model
+    call: the designer's tables, verbatim."""
+    meta = _load(pid)
+    comps = meta.get("component_data", {})
+    if not comps:
+        return ""
+    out = ["", "", "## Component data", "Authoritative tables supplied by the designer.", ""]
+    for name, rec in comps.items():
+        txt = (DATA / pid / "components" / rec["file"]).read_text(encoding="utf-8")
+        out += [f"### {name} ({rec['rows']} rows)", "```", txt.strip()[:40_000], "```", ""]
+    return "\n".join(out)
+
+
+def _component_summary(pid: str) -> str:
+    """Short form for the workshop: names and row counts only."""
+    comps = _load(pid).get("component_data", {})
+    if not comps:
+        return ""
+    return "\n\n## Component data\n" + "\n".join(
+        f"- {n}: {r['rows']} rows supplied by the designer (values listed)" for n, r in comps.items()) + "\n"
+
+
+def _rulebook_for_model(pid: str) -> str:
+    return (DATA / pid / "rulebook.txt").read_text(encoding="utf-8") + _component_section(pid)
+
+
+def _refresh_readiness(meta: dict) -> None:
+    ws = meta.get("workshop")
+    if ws:
+        ws["readiness"] = _readiness(ws, meta)
+
+
+def _missing_components(meta: dict) -> list[dict]:
+    """Component sets the workshop found unlisted and the designer has neither
+    uploaded nor waived."""
+    ws = meta.get("workshop") or {}
+    have = set(meta.get("component_data", {}))
+    waived = set(meta.get("components_waived", []))
+    return [c for c in ws.get("components", []) if not c.get("listed")
+            and c["name"] not in have and c["name"] not in waived]
+
+
+class ComponentUpload(BaseModel):
+    name: str
+    text: str
+
+
+@app.post("/api/projects/{pid}/components")
+def upload_component(pid: str, req: ComponentUpload):
+    """Save a table (CSV or a pasted table) for one component set."""
+    meta = _load(pid)
+    txt = req.text.strip()
+    if not txt or "\n" not in txt:
+        raise HTTPException(400, "paste the whole table — a header row plus one row per item")
+    if len(txt) > 200_000:
+        raise HTTPException(400, "table too large (200k characters max)")
+    cdir = DATA / pid / "components"; cdir.mkdir(exist_ok=True)
+    fname = _slug(req.name) + ".csv"
+    (cdir / fname).write_text(txt + "\n", encoding="utf-8")
+    meta.setdefault("component_data", {})[req.name] = {
+        "file": fname, "rows": max(0, txt.count("\n")), "preview": "\n".join(txt.splitlines()[:4])}
+    meta.setdefault("components_waived", [])
+    if req.name in meta["components_waived"]:
+        meta["components_waived"].remove(req.name)
+    _refresh_readiness(meta)
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/components/waive")
+def waive_component(pid: str, req: WorkshopAnswer):
+    """Designer says the values are meant to be random/invented: not a blocker."""
+    meta = _load(pid)
+    meta.setdefault("components_waived", [])
+    if req.item_id not in meta["components_waived"]:
+        meta["components_waived"].append(req.item_id)
+    _refresh_readiness(meta)
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/components/unwaive")
+def unwaive_component(pid: str, req: WorkshopAnswer):
+    meta = _load(pid)
+    meta["components_waived"] = [n for n in meta.get("components_waived", []) if n != req.item_id]
+    _refresh_readiness(meta)
+    _save(meta)
+    return meta
+
+
+@app.delete("/api/projects/{pid}/components/{name}")
+def delete_component(pid: str, name: str):
+    meta = _load(pid)
+    rec = meta.get("component_data", {}).pop(name, None)
+    if rec:
+        (DATA / pid / "components" / rec["file"]).unlink(missing_ok=True)
+    _refresh_readiness(meta)
+    _save(meta)
+    return meta
+
+
 # ============================ rules workshop ==============================
-def _readiness(ws: dict) -> int:
+def _readiness(ws: dict, meta: dict | None = None) -> int:
     items = ws.get("items", [])
-    if not items:
+    missing = len(_missing_components(meta)) if meta else 0
+    total = len(items) + missing
+    if not total:
         return 100
     done = sum(1 for it in items if it["status"] != "open")
-    return int(round(100 * done / len(items)))
+    return int(round(100 * done / total))
 
 
 @app.post("/api/projects/{pid}/workshop")
@@ -355,7 +466,7 @@ def run_workshop(pid: str):
     job = _job("workshop", pid)
 
     def work(j):
-        rulebook = rb.read_text(encoding="utf-8")
+        rulebook = rb.read_text(encoding="utf-8") + _component_summary(pid)
         items = []
         j["detail"] = "restating the rules as a structured outline"
         restated = llm.restate_rules(rulebook)
@@ -370,6 +481,7 @@ def run_workshop(pid: str):
                 items.append({"kind": row["basis"], "source": "cost table", "where": row["action"],
                               "text": f"{row['action']}: costs {row['cost']}; effect: {row['effect']}",
                               "assumption": "", "quote": ""})
+        ws["components"] = restated.get("components", [])
         j["detail"] = "walking through a sample round"
         steps = llm.walk_turn(rulebook)
         for st in steps:
@@ -441,7 +553,7 @@ def run_workshop(pid: str):
         ws["walk"] = steps
         ws["history"].append({"pass": ws["pass"], "open": sum(1 for i in items if i["status"] == "open"),
                               "auto_answered": auto, "carried": carried, "cost": llm.cost_note()})
-        ws["readiness"] = _readiness(ws)
+        ws["readiness"] = _readiness(ws, meta)
         meta["workshop"] = ws
         meta["complexity"] = _complexity(meta)
         _save(meta)
@@ -486,7 +598,7 @@ def workshop_answer(pid: str, req: WorkshopAnswer):
     q = it["text"] if it["source"] == "review" else (it["assumption"] or it["text"])
     it.setdefault("clar_key", f"ws:{it['id']}")
     _set_clarification(pid, meta, it["clar_key"], q, it["answer"])
-    ws["readiness"] = _readiness(ws)
+    ws["readiness"] = _readiness(ws, meta)
     meta["workshop"] = ws
     _save(meta)
     return meta
@@ -501,7 +613,7 @@ def workshop_undo(pid: str, req: WorkshopAnswer):
         raise HTTPException(404, "no such item")
     it["status"] = "open"; it["answer"] = ""; it.pop("deferred", None)
     _drop_clarification(pid, meta, it.get("clar_key", f"ws:{it['id']}"))
-    ws["readiness"] = _readiness(ws)
+    ws["readiness"] = _readiness(ws, meta)
     meta["workshop"] = ws
     _save(meta)
     return meta
@@ -515,7 +627,7 @@ def workshop_dismiss(pid: str, req: WorkshopAnswer):
     if not it:
         raise HTTPException(404, "no such item")
     it["status"] = "dismissed"; it["answer"] = "(not a rules question)"; it.pop("deferred", None)
-    ws["readiness"] = _readiness(ws)
+    ws["readiness"] = _readiness(ws, meta)
     meta["workshop"] = ws
     _save(meta)
     return meta
@@ -589,7 +701,7 @@ def build_checkers(pid: str):
     job = _job("checkers", pid)
 
     def work(j):
-        rulebook = rb.read_text(encoding="utf-8")
+        rulebook = _rulebook_for_model(pid)
         cdir = DATA / pid / "checkers"
         cdir.mkdir(exist_ok=True)
         j["detail"] = "recording a sample game for the trace format"
@@ -787,7 +899,7 @@ def resolve_finding(pid: str, req: Resolution):
         findings = entry["findings"]
 
         def work(j):
-            rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+            rulebook = _rulebook_for_model(pid)
             code = (DATA / pid / "game.py").read_text(encoding="utf-8")
             error = (f"An independent auditor of the rule '{entry['rule']}' reports these "
                      f"violations, and the designer has confirmed the engine is wrong:\n"
@@ -846,6 +958,24 @@ def resolve_finding(pid: str, req: Resolution):
     raise HTTPException(400, "decision must be engine, auditor, rulebook or answer")
 
 
+@app.get("/api/projects/{pid}/diff/{v}")
+def version_diff(pid: str, v: int):
+    """Unified diff between saved version v and the current engine, plus a
+    plain count so a no-op 'fix' is visible at a glance."""
+    import difflib
+    meta = _load(pid)
+    old = DATA / pid / "versions" / f"v{v}.py"
+    cur = DATA / pid / "game.py"
+    if not old.exists() or not cur.exists():
+        raise HTTPException(404, "no such version")
+    a_lines = old.read_text(encoding="utf-8").splitlines()
+    b_lines = cur.read_text(encoding="utf-8").splitlines()
+    diff = list(difflib.unified_diff(a_lines, b_lines, f"v{v}", "current", lineterm="", n=2))
+    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    return {"added": added, "removed": removed, "diff": "\n".join(diff)[:60000]}
+
+
 @app.get("/api/projects/{pid}/versions")
 def list_versions(pid: str):
     meta = _load(pid)
@@ -882,7 +1012,7 @@ def _wait_job(jid: str, timeout: float = 3600, parent: dict | None = None) -> di
 
 
 def _repair_and_reaudit(pid: str, meta: dict, j: dict, reason: str, findings: list[str], label: str):
-    rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+    rulebook = _rulebook_for_model(pid)
     code = (DATA / pid / "game.py").read_text(encoding="utf-8")
     error = reason + "\n" + "\n".join(findings[:25])
     j["detail"] = f"fixing the engine: {label}"
@@ -906,7 +1036,7 @@ def run_jury(pid: str, j: dict) -> None:
     route by agreement. Unanimous -> fix; proxy sides with engine -> mute;
     rulebook silent -> provisional ruling + inbox question."""
     meta = _load(pid)
-    rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+    rulebook = _rulebook_for_model(pid)
     trail = meta.get("jury_trail", [])
     inbox = meta.get("inbox", [])
     fixes = 0
@@ -915,7 +1045,11 @@ def run_jury(pid: str, j: dict) -> None:
         if not c["n_findings"]:
             continue
         j["detail"] = f"jury: {c['name']}"
-        ctx = _moment_context(_engine_for(meta), c["findings"][0]) if c["findings"] else ""
+        g = _engine_for(meta)
+        ctx = _moment_context(g, c["findings"][0]) if c["findings"] else ""
+        story = _narrate_moment(g, c["findings"][0]) if c["findings"] else ""
+        if story:
+            ctx = ctx + "\n\nReplay in the game's own words:\n" + story
         fr = llm.frame_finding(c["name"], c["rule"], c["findings"], ctx)
         px = llm.proxy_answer(rulebook, fr["scenario"], fr["question"])
         entry = {"auditor": c["name"], "rule": c["rule"], **fr, "proxy": px, "time": time.time()}
@@ -953,7 +1087,7 @@ def run_jury(pid: str, j: dict) -> None:
         meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
     if to_fix:
         # one repair covering every confirmed violation, one validation, one re-audit
-        rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+        rulebook = _rulebook_for_model(pid)
         code = (DATA / pid / "game.py").read_text(encoding="utf-8")
         reason = ("Independent auditors and an independent rules expert (reading the rulebook only) "
                   "agree the engine is wrong on these points; fix ALL of them:\n")
@@ -1003,16 +1137,22 @@ def inbox_answer(pid: str, req: InboxAnswer):
     it = next((i for i in meta.get("inbox", []) if i["id"] == req.item_id), None)
     if not it:
         raise HTTPException(404, "no such question")
+    if not req.answer.strip():
+        raise HTTPException(400, "write the answer first")
+    if _running_for(pid):
+        b = _running_for(pid)[0]
+        raise HTTPException(409, f"'{b['kind']}' is still running on this game ({b.get('detail') or 'working'}) — "
+                                 "your answer wasn't applied; try again when it finishes")
+    side = llm.compare_answer(it["engine_value"], it["auditor_value"], req.answer.strip())
     it["status"] = "answered"; it["answer"] = req.answer.strip()
     _set_clarification(pid, meta, f"inbox:{it['id']}",
                        f"{it['question']} (scenario: {it['scenario']})", it["answer"])
-    _save(meta)
-    side = llm.compare_answer(it["engine_value"], it["auditor_value"], it["answer"])
     if side == "A":
         it["outcome"] = "matches what the engine did — nothing to change"
         _save(meta)
         return {"meta": meta, "job": None}
-    job = _job("fix", pid)
+    job = _job("fix", pid)   # lock checked above, so this cannot fail after the answer is saved
+    _save(meta)
 
     def work(j):
         m = _load(pid)
@@ -1100,7 +1240,7 @@ def fix_from_findings(pid: str):
     job = _job("fix", pid)
 
     def work(j):
-        rulebook = (DATA / pid / "rulebook.txt").read_text(encoding="utf-8")
+        rulebook = _rulebook_for_model(pid)
         code = (DATA / pid / "game.py").read_text(encoding="utf-8")
         error = ("Independent rule auditors, written from the rulebook only, report "
                  "these violations in games your engine played:\n" + "\n".join(findings[:25]))
@@ -1146,7 +1286,7 @@ def generate(pid: str, force: bool = False):
         return _validate_file(pid)
 
     def work(j):
-        rulebook = rb.read_text(encoding="utf-8")
+        rulebook = _rulebook_for_model(pid)
         j["detail"] = "asking the model for an engine"
         try:
             code = llm.generate_engine(rulebook)
@@ -1263,7 +1403,7 @@ def run_second_opinion(pid: str):
     job = _job("second_opinion", pid)
 
     def work(j):
-        rulebook = rb.read_text(encoding="utf-8")
+        rulebook = _rulebook_for_model(pid)
         j["detail"] = "asking the model for an independent second engine"
         code = llm.generate_engine(rulebook)
         rounds = 0
@@ -1283,6 +1423,15 @@ def run_second_opinion(pid: str):
         j["detail"] = "comparing the two engines on random play"
         meta["second_opinion"] = sandbox.run("second", timeout=900, path_a=str(DATA / pid / "game.py"),
                                              path_b=str(DATA / pid / "game2.py"))
+        missing = _missing_components(meta)
+        if missing and any(r.get("status") == "flag" for r in meta["second_opinion"] if isinstance(r, dict)):
+            meta["second_opinion"].insert(0, {
+                "check": "invented components", "status": "flag",
+                "detail": "Both engines had to invent " + ", ".join(c["name"] for c in missing) +
+                          " because the rulebook does not list their values, so they cannot agree on "
+                          "anything that depends on them (game length, pacing, lock-in). Upload the "
+                          "tables in the workshop and rebuild before reading these disagreements as "
+                          "rules problems."})
         meta["second_opinion_cost"] = llm.cost_note()
         _save(meta)
 
@@ -1337,7 +1486,8 @@ def job_status(jid: str):
 
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    return FileResponse(Path(__file__).parent / "static" / "index.html",
+                        headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"),

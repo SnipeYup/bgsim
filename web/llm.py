@@ -198,6 +198,17 @@ class TruncatedOutput(RuntimeError):
                          f"{lines} lines; partial output saved as partial.py")
 
 
+COMPONENT_NOTE = """
+=== component data ===
+The rulebook is followed by a section "Component data" with tables the designer \
+supplied. Those tables are AUTHORITATIVE: embed every row verbatim as a constant \
+in the engine (do not read files, do not invent, do not summarise or generate \
+substitutes). Where the rulebook references a component set with no table, \
+you must invent stand-ins — then name them in a module-level constant \
+INVENTED_COMPONENTS = [...] so the app can warn the designer.
+"""
+
+
 def generate_engine(rulebook: str) -> str:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
@@ -473,7 +484,16 @@ Return ONLY a JSON object: {{"outline": [{{"section": "<name>", "lines": \
 [{{"text": "<one rule, one line>", "basis": "stated"|"inferred"|"unclear", \
 "assumption": "<what you assumed, or empty>", "quote": "<short rulebook phrase \
 this rests on, or empty>"}}]}}], "cost_table": [{{"action": "<name>", \
-"cost": "<exact>", "effect": "<exact>", "basis": "stated"|"inferred"|"unclear"}}]}}
+"cost": "<exact>", "effect": "<exact>", "basis": "stated"|"inferred"|"unclear"}}], \
+"components": [{{"name": "<component set, e.g. 'development cards'>", "count": \
+"<how many, if stated>", "fields": "<the values each one carries, e.g. 'level, \
+cost per colour, bonus colour, prestige'>", "listed": true|false}}]}}
+
+"components" is every set of game pieces whose individual values matter to \
+play — cards, tiles, tokens with printed values, a tech tree — with "listed" \
+true only if the rulebook actually gives every item's values (a section \
+"Component data" counts as listed). A simulation cannot be faithful to \
+unlisted components: it would have to invent them.
 
 If the rulebook ends with a section "Clarifications from the designer", \
 those clarifications are authoritative rulings: anything they settle counts \
@@ -559,7 +579,10 @@ def restate_rules(rulebook: str) -> dict:
     table = [{"action": str(r.get("action", ""))[:80], "cost": str(r.get("cost", ""))[:200],
               "effect": str(r.get("effect", ""))[:300], "basis": r.get("basis", "stated")}
              for r in data.get("cost_table", []) if isinstance(r, dict)]
-    return {"outline": outline, "cost_table": table}
+    comps = [{"name": str(c.get("name", ""))[:80], "count": str(c.get("count", ""))[:40],
+              "fields": str(c.get("fields", ""))[:200], "listed": bool(c.get("listed"))}
+             for c in data.get("components", []) if isinstance(c, dict) and c.get("name")]
+    return {"outline": outline, "cost_table": table, "components": comps}
 
 
 def walk_turn(rulebook: str, n_players: int = 2) -> list[dict]:
@@ -597,7 +620,11 @@ factual question a rules expert could answer from the rulebook alone, without \
 seeing these findings. Describe the scenario in game terms (round, players, \
 resources) with the exact numbers; never mention steps, traces, engines or \
 auditors. Also extract, as short values, what the simulation actually did and \
-what the auditor says should have happened.
+what the auditor says should have happened — in game terms a designer reads \
+("the game ended at once" / "play continued to the last player"), NEVER as \
+variable names, flags, indices or code (no "x = True", "player -1", "phase"). \
+State turn-order facts (who is the starting player, who acts last) as facts \
+taken from the replay, and keep the scenario internally consistent.
 
 The "moment in the game record" below is what the simulation was actually \
 doing at the flagged step — its phase and pending action. If it shows the \
@@ -636,8 +663,11 @@ Return ONLY a JSON object: {{"answer": "<short answer, or empty if unsettled>", 
 """
 
 COMPARE_PROMPT = """Two candidate outcomes for a board game scenario, and an expert's \
-answer. Say which candidate the expert's answer agrees with. Return ONLY a JSON \
-object: {{"agrees_with": "A"|"B"|"neither"}}
+answer. Say which candidate the expert's answer agrees with. Judge agreement on \
+the RULE being applied, not on incidental details: if the expert states the \
+same rule as a candidate but names a different seat, colour or number because \
+the scenario was worded differently, that still counts as agreement. Return \
+ONLY a JSON object: {{"agrees_with": "A"|"B"|"neither"}}
 
 Candidate A: {a}
 Candidate B: {b}

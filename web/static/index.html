@@ -100,6 +100,8 @@
   .answers{display:flex; flex-direction:column; gap:6px; margin:6px 0}
   .ans{text-align:left; font:inherit; font-size:14px; padding:9px 12px; border:1.5px solid var(--felt); border-radius:6px; background:#fff; color:var(--ink); cursor:pointer}
   .ans:hover{background:#EEF3EF} .ans .tag{display:block; font-size:12px; color:var(--ink-soft); margin-top:3px}
+  .diff{font:11.5px/1.4 ui-monospace,Consolas,monospace; background:#1f2a24; color:#dfe6e1; padding:10px; border-radius:6px; max-height:420px; overflow:auto; white-space:pre}
+  .dadd{color:#9be29b} .ddel{color:#ff9c9c} .dhunk{color:#8fc5ff}
   .decide{margin-top:6px; font-size:13px} .decide summary{cursor:pointer; color:var(--ink-soft)}
   .resolve{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px}
   .resolve .btn{padding:5px 9px; font-size:12.5px}
@@ -289,6 +291,7 @@ function renderWorkshop(p){
     <div class="qq">${ws.items.length} places the model wasn't certain · ${auto} answered from your own text · ${ws.items.filter(i=>i.status==='confirmed'||i.status==='answered').length} settled by you · ${ws.items.filter(i=>i.status==='dismissed').length} not rules questions · ${open.length} open</div>
     ${shown.length ? shown.map(itemHtml).join('') : (open.length ? '' : '<p class="status ok">Nothing open. Your rules are ready.</p>')}
     ${deferred.length?`<details><summary>${deferred.length} set aside as "not sure"</summary>${deferred.map(itemHtml).join('')}</details>`:''}
+    ${renderComponents(p, ws)}
     ${(()=>{ const done = ws.items.filter(i=>i.status==='confirmed'||i.status==='answered'||i.status==='dismissed'); return done.length?`<details><summary>${done.length} settled by you</summary>${done.map(i=>`<div class="qq">${esc(i.text)} → <b>${esc(i.answer)}</b> <button class="btn" style="padding:2px 7px;font-size:11px" onclick="wsUndo('${p.id}','${i.id}')">Undo</button></div>`).join('')}</details>`:''; })()}
     <details><summary>Cost table as the model reads it (${ws.cost_table.length} actions)</summary><table class="ct">${ws.cost_table.map(r=>`<tr class="${r.basis}"><td>${esc(r.action)}</td><td>${esc(r.cost)}</td><td>${esc(r.effect)}</td><td class="basis">${r.basis}</td></tr>`).join('')}</table></details>
     <details><summary>A sample round, as the model would play it</summary><ol>${ws.walk.map(s=>`<li>${esc(s.text)}${s.assumption?` <i class="asm">(assumed: ${esc(s.assumption)})</i>`:''}</li>`).join('')}</ol></details>
@@ -408,7 +411,7 @@ function renderInbox(p){
     <div class="qq">The simulation did: <b>${esc(i.engine_value)}</b> · the auditor expected: <b>${esc(i.auditor_value)}</b>${i.proxy_note?` · rules expert: ${esc(i.proxy_note)}`:''}</div>
     <div class="qq">Meanwhile the report assumes: ${esc(i.provisional)}</div>
     <div class="resolve"><input type="text" id="ib-${i.id}" placeholder="your answer, in your words" style="flex:1;min-width:200px">
-    <button class="btn amber" onclick="inboxAnswer('${p.id}','${i.id}')">Settle it</button></div></div>`;
+    <button class="btn amber" onclick="inboxAnswer('${p.id}','${i.id}', this)">Settle it</button></div></div>`;
   const done = inbox.filter(i=>i.status!=='open');
   return `<div class="stage inbox"><b>Inbox</b> — ${open.length? open.length+' question(s) only you can answer' : 'no open questions'}
     ${open.map(q).join('')}
@@ -416,12 +419,19 @@ function renderInbox(p){
     ${trail.length?`<details><summary>Jury trail — ${trail.length} automatic decision(s)</summary>${trail.map(e=>`<div class="qq"><b>${esc(e.auditor)}</b>: ${esc(e.verdict)}${e.proxy&&e.proxy.quote?` · "${esc(e.proxy.quote)}"`:''}</div>`).join('')}</details>`:''}
   </div>`;
 }
-async function inboxAnswer(id, item){
-  const st = $('#engstat'); const a = $('#ib-'+item).value;
-  if(!a.trim()) return;
+async function inboxAnswer(id, item, btn){
+  const a = $('#ib-'+item).value;
+  if(!a.trim()){ alert('Write the answer first.'); return; }
+  if(BUSY){ alert('Something is already running on this game — wait for it to finish.'); return; }
+  const st = document.createElement('span'); st.className='status'; st.style.cssText='margin-left:8px';
+  st.innerHTML = '<span class="spin"></span>Comparing your answer…';
+  if(btn){ btn.disabled = true; btn.insertAdjacentElement('afterend', st); }
+  BUSY = true;
   try{ const r = await api('/projects/'+id+'/inbox/answer', {item_id:item, answer:a});
-       if(r.job){ await watch(r.job.id, st, 'Applying your answer'); } open(id); }
-  catch(e){ st.className='status err'; st.textContent=e.message; }
+       if(r.job){ await watch(r.job.id, st, 'Applying your answer'); }
+       else { st.className='status ok'; st.textContent='Your answer matches what the simulation already does — saved.'; await new Promise(r=>setTimeout(r,1200)); }
+       BUSY=false; open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; if(btn) btn.disabled=false; BUSY=false; }
 }
 async function setBudget(id, cur){
   const v = prompt('Model spend budget for this game, in dollars:', cur);
@@ -429,6 +439,34 @@ async function setBudget(id, cur){
   await api('/projects/'+id+'/budget', {budget_usd: +v}); open(id);
 }
 async function runAll(id, btn){ await fromButton(btn, 'Running everything', ()=>api('/projects/'+id+'/run-all', {})); }
+function renderComponents(p, ws){
+  const comps = ws.components||[]; if(!comps.length) return '';
+  const have = p.component_data||{}; const waived = new Set(p.components_waived||[]);
+  const rows = comps.map(c=>{
+    const got = have[c.name];
+    if(got) return `<div class="qq">&#10003; <b>${esc(c.name)}</b> — ${got.rows} rows supplied <button class="btn" style="padding:2px 7px;font-size:11px" onclick="dropComponent('${p.id}','${esc(c.name)}')">remove</button></div>`;
+    if(c.listed) return `<div class="qq">&#10003; <b>${esc(c.name)}</b> — values are in your rulebook</div>`;
+    if(waived.has(c.name)) return `<div class="qq">&#8212; <b>${esc(c.name)}</b> — you said invented stand-ins are fine <button class="btn" style="padding:2px 7px;font-size:11px" onclick="unwaiveComponent('${p.id}','${esc(c.name)}')">undo</button></div>`;
+    const id = 'comp-'+c.name.replace(/[^a-z0-9]/gi,'_');
+    return `<div class="item"><span class="tag" style="background:var(--alert);color:#fff">component values missing</span>
+      <div><b>${esc(c.name)}</b>${c.count?` (${esc(c.count)})`:''} — your rulebook refers to these but doesn't list their values${c.fields?`: ${esc(c.fields)}`:''}. Without them the simulation has to <b>invent</b> them, and anything that depends on their numbers — game length, pacing, which strategies win — won't be trustworthy.</div>
+      <textarea id="${id}" rows="4" placeholder="Paste a table: a header row, then one row per item. CSV or tab-separated is fine, e.g.
+level,cost_white,cost_blue,cost_green,cost_red,cost_black,bonus,points
+1,1,1,1,1,0,black,0" style="width:100%;margin-top:6px;font:12px ui-monospace,Consolas,monospace"></textarea>
+      <div class="resolve"><button class="btn amber" onclick="uploadComponent('${p.id}','${esc(c.name)}','${id}', this)">Save this table</button>
+      <button class="btn" onclick="waiveComponent('${p.id}','${esc(c.name)}')" title="For a game where these values are meant to be random or you only care about the rules">Invented values are fine for now</button></div></div>`;
+  }).join('');
+  return `<details open><summary>Components — ${comps.filter(c=>!c.listed && !have[c.name] && !waived.has(c.name)).length} missing values</summary>${rows}</details>`;
+}
+async function uploadComponent(id, name, taId, btn){
+  const text = document.getElementById(taId).value;
+  if(btn) btn.disabled = true;
+  try{ await api('/projects/'+id+'/components', {name, text}); open(id); }
+  catch(e){ alert(e.message); if(btn) btn.disabled = false; }
+}
+async function waiveComponent(id, name){ await api('/projects/'+id+'/components/waive', {item_id:name}); open(id); }
+async function unwaiveComponent(id, name){ await api('/projects/'+id+'/components/unwaive', {item_id:name}); open(id); }
+async function dropComponent(id, name){ if(!confirm('Remove this table? The engine will need rebuilding.')) return; await api('/projects/'+id+'/components/'+encodeURIComponent(name), null, 'DELETE'); open(id); }
 function renderSpend(p){
   const L = p.spend_ledger||[]; if(!L.length) return '';
   const byStage = {}; for(const e of L){ const k=e.stage.split(':')[0]; byStage[k]=(byStage[k]||0)+e.usd; }
@@ -440,8 +478,16 @@ function renderVersions(p){
   const v = p.versions || [];
   if(!v.length && !p.current_label) return '';
   return `<details class="versions"><summary>Engine version: ${esc(p.current_label||'engine')}${v.length?` · ${v.length} earlier`:''}</summary>
-    ${v.slice().reverse().map(x=>`<div class="vrow">v${x.v} · ${esc(x.label)} <button class="btn" style="padding:3px 8px;font-size:12px" onclick="revertTo('${p.id}',${x.v})">Revert to this</button></div>`).join('')}
+    ${v.slice().reverse().map(x=>`<div class="vrow">v${x.v} · ${esc(x.label)} <button class="btn" style="padding:3px 8px;font-size:12px" onclick="revertTo('${p.id}',${x.v})">Revert to this</button> <button class="btn" style="padding:3px 8px;font-size:12px" onclick="showDiff('${p.id}',${x.v},this)">What changed since this?</button><div class="diffbox"></div></div>`).join('')}
   </details>`;
+}
+async function showDiff(id, v, btn){
+  const box = btn.parentElement.querySelector('.diffbox');
+  if(box.innerHTML){ box.innerHTML=''; return; }
+  try{ const d = await api('/projects/'+id+'/diff/'+v);
+       const lines = d.diff.split('\n').map(l=>`<span class="${l.startsWith('+')?'dadd':l.startsWith('-')?'ddel':l.startsWith('@@')?'dhunk':''}">${esc(l)}</span>`).join('\n');
+       box.innerHTML = `<div class="qq">${d.added} line(s) added, ${d.removed} removed${(!d.added&&!d.removed)?' — <b>the files are identical</b>':''}</div><pre class="diff">${lines||'(no differences)'}</pre>`; }
+  catch(e){ box.innerHTML = `<span class="status err">${esc(e.message)}</span>`; }
 }
 async function revertTo(id, v){
   if(!confirm('Revert the engine to this version? Audits and reports will need re-running.')) return;
@@ -500,6 +546,7 @@ async function runSim(id, btn){
     st.className='status ok'; st.textContent='Done.';
     loadReport(id);
   }catch(e){ st.className='status err'; st.textContent=e.message; }
+  finally{ if(btn) btn.disabled = false; }
 }
 
 async function deleteProject(id, name){

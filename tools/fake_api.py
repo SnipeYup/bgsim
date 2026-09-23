@@ -68,7 +68,9 @@ class H(BaseHTTPRequestHandler):
                 {"section": "end of game", "lines": [
                     {"text": "Ties are unresolved.", "basis": "unclear", "assumption": "shared victory", "quote": ""}]}],
                 "cost_table": [{"action": "Build room", "cost": "5 wood 2 reed", "effect": "one room", "basis": "stated"},
-                               {"action": "Build stable", "cost": "2 wood", "effect": "one stable", "basis": "inferred"}]}))
+                               {"action": "Build stable", "cost": "2 wood", "effect": "one stable", "basis": "inferred"}],
+                "components": [{"name": "development cards", "count": "90", "fields": "level, cost per colour, bonus colour, prestige", "listed": ("## Component data" in text)},
+                               {"name": "noble tiles", "count": "10", "fields": "requirements, prestige", "listed": ("## Component data" in text)}]}))
         if "narrate one complete sample round of play" in text:
             return self._stream_text(json.dumps({"steps": [
                 {"text": "Player 1 takes 3 wood from the Forest.", "assumption": ""},
