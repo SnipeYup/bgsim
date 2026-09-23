@@ -129,11 +129,13 @@ MUTATING = {"generate", "checkers", "jury", "fix", "resolve_answer", "second_opi
 
 def _running_for(pid: str):
     return [j for j in JOBS.values() if j.get("project") == pid and j["status"] == "running"
-            and j.get("kind") in MUTATING]
+            and j.get("kind") in MUTATING and not j.get("parent")]
 
 
 def _job(kind: str, pid: str) -> dict:
-    if kind in MUTATING:
+    parent = getattr(_current, "job", None)
+    nested = parent is not None and parent.get("project") == pid and parent["status"] == "running"
+    if kind in MUTATING and not nested:   # a job may start its own sub-jobs
         busy = _running_for(pid)
         if busy:
             b = busy[0]
@@ -141,6 +143,8 @@ def _job(kind: str, pid: str) -> dict:
                                      f"({b.get('detail') or 'working'}); wait for it to finish")
     j = _StagedJob({"id": uuid.uuid4().hex[:10], "kind": kind, "project": pid,
                     "status": "running", "started": time.time(), "detail": "", "error": None})
+    if nested:
+        j["parent"] = parent["id"]
     JOBS[j["id"]] = j
     return j
 
@@ -863,11 +867,16 @@ def revert_version(pid: str, v: int):
 
 
 # ================================= jury ===================================
-def _wait_job(jid: str, timeout: float = 3600) -> dict:
+def _wait_job(jid: str, timeout: float = 3600, parent: dict | None = None) -> dict:
     t0 = time.time()
+    parent = parent or getattr(_current, "job", None)
     while JOBS[jid]["status"] == "running":
         if time.time() - t0 > timeout:
             raise RuntimeError("sub-step timed out")
+        if parent is not None and JOBS[jid].get("detail"):
+            parent["detail"] = f"{JOBS[jid]['kind']}: {JOBS[jid]['detail']}"
+        if parent is not None and parent.get("cancel"):
+            JOBS[jid]["cancel"] = True
         time.sleep(1)
     return JOBS[jid]
 
@@ -1311,6 +1320,9 @@ def cancel_job(jid: str):
     if jid not in JOBS:
         raise HTTPException(404, "unknown job")
     JOBS[jid]["cancel"] = True
+    for j in JOBS.values():
+        if j.get("parent") == jid and j["status"] == "running":
+            j["cancel"] = True
     return {"ok": True}
 
 
