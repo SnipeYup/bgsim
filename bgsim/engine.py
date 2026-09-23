@@ -79,6 +79,7 @@ def play_game(game: Game, agents: Sequence[Agent], seed: int,
     n_turns = 0
     n_actions = 0
     unfinished = False
+    timeline = []   # (turn, [primary score per player]) sampled each main-phase turn
     while not game.is_terminal(state):
         if n_actions >= max_actions:
             # The rules allow play to continue forever (e.g. two players taking
@@ -89,6 +90,12 @@ def play_game(game: Game, agents: Sequence[Agent], seed: int,
         p = game.current_player(state)
         if game.phase(state) == "main":
             n_turns += 1
+            if n_turns % max(1, len(agents)) == 0:   # once per round
+                try:
+                    timeline.append((n_turns, [float(sc[0]) if isinstance(sc, (tuple, list)) else float(sc)
+                                              for sc in game.scores(state)]))
+                except Exception:
+                    pass
         action = agents[p].act(game, state, p)
         if debug:
             legal = game.legal_actions(state)
@@ -99,6 +106,9 @@ def play_game(game: Game, agents: Sequence[Agent], seed: int,
             game.check_invariants(state)
     extra = game.summary(state) if hasattr(game, "summary") else {}
     extra["unfinished"] = unfinished
+    if timeline:
+        step = max(1, len(timeline) // 24)   # keep records small: ≤ ~24 samples
+        extra["timeline"] = timeline[::step] + ([timeline[-1]] if (len(timeline) - 1) % step else [])
     return GameRecord(seed=seed, n_players=n, n_turns=n_turns,
                       n_actions=n_actions, winners=winners(game, state),
                       scores=game.scores(state),

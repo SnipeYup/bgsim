@@ -27,6 +27,9 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
               f"- unfinished (hit the action cap; rules allow indefinite play): "
               f"{sum(1 for r in records if r.extra.get('unfinished'))}", ""]
 
+    # --- lead lock-in (a finding, not a fault: some games are meant to snowball)
+    lines += lead_lockin(records)
+
     # --- seat advantage
     seat_wins = [0.0] * n_players
     for r in records:
@@ -127,3 +130,64 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
                   f"- nobles claimed per game: {sum(nobles.values()) / n:.2f}",
                   f"- claimed by eventual winner: {_pct(sum(nobles_winner.values()) / max(1, sum(nobles.values())))}", ""]
     return "\n".join(lines)
+
+
+def _leader_at(timeline, turn):
+    """Leader (or None on a tie) using the last sample at or before `turn`."""
+    best = None
+    for t, sc in timeline:
+        if t <= turn:
+            best = sc
+        else:
+            break
+    if best is None:
+        return None, None
+    top = max(best)
+    leaders = [i for i, v in enumerate(best) if v == top]
+    ranked = sorted(best, reverse=True)
+    gap = ranked[0] - ranked[1] if len(ranked) > 1 else 0.0
+    return (leaders[0] if len(leaders) == 1 else None), gap
+
+
+def lead_lockin(records, fractions=(0.25, 0.4, 0.5, 0.6, 0.75, 0.9)) -> list[str]:
+    tl = [r for r in records if r.extra.get("timeline") and len(r.winners) == 1]
+    if len(tl) < 20:
+        return []
+    rows = []
+    for f in fractions:
+        hits, tot, gaps = 0, 0, []
+        for r in tl:
+            leader, gap = _leader_at(r.extra["timeline"], f * r.n_turns)
+            if leader is None:
+                continue
+            tot += 1
+            hits += leader in r.winners
+            final = max(sc[0] if isinstance(sc, (tuple, list)) else sc for sc in r.scores) or 1
+            gaps.append(gap / final)
+        if tot:
+            rows.append((f, hits / tot, mean(gaps), tot))
+    if not rows:
+        return []
+    half = next((p for f, p, _, _ in rows if abs(f - 0.5) < 1e-9), None)
+    early = next((p for f, p, _, _ in rows if abs(f - 0.25) < 1e-9), None)
+    out = ["## Lead lock-in",
+           "How often the player leading at a given point goes on to win. Reading it: "
+           "a curve that climbs gradually means games stay contested; one that is already "
+           "high early means leads snowball. Neither is a fault by itself — some designs "
+           "want a runaway leader — but it should be a choice.",
+           "", "| point in game | leader goes on to win | lead size (share of winning score) | games |",
+           "|---|---|---|---|"]
+    out += [f"| {int(f * 100)}% | {_pct(p)} | {g:.0%} | {t} |" for f, p, g, t in rows]
+    notes = []
+    if half is not None:
+        notes.append(f"- comeback rate: in {_pct(1 - half)} of games the mid-game leader did NOT win")
+    if early is not None and early >= 0.8:
+        notes.append("- **finding**: the leader at the quarter mark wins "
+                     f"{_pct(early)} of the time — the outcome is largely settled early")
+    elif half is not None and half >= 0.85:
+        notes.append("- **finding**: the mid-game leader wins "
+                     f"{_pct(half)} of the time — the second half rarely changes the result")
+    notes.append("- caveat: simple agents rarely execute comebacks, so these numbers run higher "
+                 "than a human table; compare between games or versions rather than reading them "
+                 "as absolutes")
+    return out + [""] + notes + [""]

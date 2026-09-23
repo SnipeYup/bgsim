@@ -217,6 +217,7 @@ function refresh0(p){
     ${p.complexity ? `<p class="status">${p.complexity.tier==='heavy'?'Heavy game':'Light game'} (score ${p.complexity.score}: ${p.complexity.words.toLocaleString()} words, ${p.complexity.actions} actions) · model spend $${(p.spend_usd||0).toFixed(2)} of $${p.complexity.budget_usd.toFixed(0)} budget
       <button class="btn" style="padding:2px 7px;font-size:11px;margin-left:6px" onclick="setBudget('${p.id}',${p.complexity.budget_usd})">change</button></p>` : (p.spend_usd?`<p class="status">model spend $${p.spend_usd.toFixed(2)}</p>`:'')}
     ${renderSpend(p)}
+    <div id="running"></div>
     <p class="status" id="engstat">${
       p.builtin ? 'Engine: built-in '+p.builtin :
       p.engine==='generated' ? 'Engine: generated · '+(p.validation||'') :
@@ -242,6 +243,7 @@ function refresh0(p){
     <div class="pad" id="pad"></div>
   </div>`;
   window.__builtin = p.builtin; buildSeats(); renderQuality(p);
+  showRunning(p.id);
   if(p.has_report) loadReport(p.id);
   else $('#pad').innerHTML = canRun ?
     '<p class="empty">No report yet. Run the games and the score pad fills in here.</p>' : '';
@@ -291,7 +293,7 @@ function renderWorkshop(p){
     <details><summary>Cost table as the model reads it (${ws.cost_table.length} actions)</summary><table class="ct">${ws.cost_table.map(r=>`<tr class="${r.basis}"><td>${esc(r.action)}</td><td>${esc(r.cost)}</td><td>${esc(r.effect)}</td><td class="basis">${r.basis}</td></tr>`).join('')}</table></details>
     <details><summary>A sample round, as the model would play it</summary><ol>${ws.walk.map(s=>`<li>${esc(s.text)}${s.assumption?` <i class="asm">(assumed: ${esc(s.assumption)})</i>`:''}</li>`).join('')}</ol></details>
     <details><summary>Full outline (${ws.outline.reduce((n,s)=>n+s.lines.length,0)} lines — you don't need to read this)</summary>${ws.outline.map(s=>`<b>${esc(s.section)}</b><ul>${s.lines.map(l=>`<li class="${l.basis}">${esc(l.text)}</li>`).join('')}</ul>`).join('')}</details>
-    <p>${ws.pass<5?`<button class="btn" onclick="runWorkshop('${p.id}', this)">Re-review with my answers (~$0.15)</button>`:'<span class="status err">All 5 passes used — remaining open items usually mean the rulebook needs an edit.</span>'}
+    <p>${ws.pass<5?`<button class="btn" onclick="runWorkshop('${p.id}', this)">Re-review with my answers (~$0.15)</button>`:(ws.readiness<100?'<span class="status err">All 5 passes used — remaining open items usually mean the rulebook needs an edit.</span>':'')}
     ${DEV && ws.pass>=5 ? `<button class="btn" style="padding:4px 8px;font-size:12px" onclick="wsResetPasses('${p.id}')">Reset passes (dev)</button>`:''}</p></div>`;
 }
 async function runWorkshop(id, btn){ await fromButton(btn, 'Workshop', ()=>api('/projects/'+id+'/workshop', {})); }
@@ -504,6 +506,21 @@ async function deleteProject(id, name){
   if(!confirm(`Delete "${name}" and everything in it — rulebook, engine, versions, reports? This can't be undone.`)) return;
   try{ await api('/projects/'+id, null, 'DELETE'); current=null; refresh(); }
   catch(e){ alert(e.message); }
+}
+async function showRunning(id){
+  let jobs = [];
+  try{ jobs = await api('/projects/'+id+'/jobs'); }catch(e){ return; }
+  const el = $('#running'); if(!el) return;
+  if(!jobs.length){ el.innerHTML=''; BUSY=false; return; }
+  BUSY = true;
+  document.querySelectorAll('#main .btn:not(.keep)').forEach(b=>{ if(!/Stop|Delete/.test(b.textContent)) b.disabled=true; });
+  const j = jobs[0];
+  el.innerHTML = `<div class="stage" style="border-left:4px solid var(--token)"><span class="spin"></span><b>${esc(j.kind.replace(/_/g,' '))}</b> is running — ${esc(j.detail||'working')} <span style="opacity:.6">(${Math.floor(j.elapsed/60)}m ${Math.floor(j.elapsed%60)}s)</span>
+    ${DEV?` <button class="btn keep" style="padding:2px 8px;font-size:11px;background:var(--alert)" onclick="stopJob('${j.id}')">Stop</button>`:''}
+    <div class="qq">You can leave this page; it will update when the run finishes.</div></div>`;
+  setTimeout(async ()=>{ if(current!==id) return;
+    let still=[]; try{ still = await api('/projects/'+id+'/jobs'); }catch(e){}
+    if(still.length) showRunning(id); else open(id); }, 2000);
 }
 async function stopJob(jid){ try{ await api('/jobs/'+jid+'/cancel', {}); }catch(e){ alert(e.message); } }
 async function watch(jid, el, verb){

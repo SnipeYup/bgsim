@@ -1270,6 +1270,16 @@ def get_report(pid: str):
     return {"markdown": p.read_text(encoding="utf-8")}
 
 
+@app.get("/api/projects/{pid}/jobs")
+def project_jobs(pid: str):
+    """Running jobs for this game, so a freshly loaded page can show them."""
+    out = []
+    for j in JOBS.values():
+        if j.get("project") == pid and j["status"] == "running":
+            d = dict(j); d["elapsed"] = round(time.time() - j["started"], 1); out.append(d)
+    return out
+
+
 @app.get("/api/config")
 def config():
     return {"dev": DEV_MODE}
