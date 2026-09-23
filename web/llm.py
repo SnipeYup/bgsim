@@ -132,7 +132,26 @@ complete Python file, no fences, no commentary.
 """
 
 
-def _call_streaming(key: str, body: dict) -> str:
+RETRYABLE = (ConnectionError, ConnectionResetError, TimeoutError, OSError)
+
+
+def _call_streaming(key: str, body: dict, attempts: int = 3) -> str:
+    """Front door for every model call: retries a stalled or dropped
+    connection (the network, not the model), never a real API error."""
+    last = None
+    for attempt in range(attempts):
+        try:
+            return _call_streaming_once(key, body)
+        except (Cancelled, BudgetExceeded, TruncatedOutput):
+            raise
+        except RETRYABLE as e:
+            last = e
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"the connection to the model kept failing ({type(last).__name__}: {last}); "
+                       "nothing was changed — try again") from None
+
+
+def _call_streaming_once(key: str, body: dict) -> str:
     """Stream the response so the connection never looks idle; assemble the
     text deltas. Returns the full text."""
     body = dict(body, stream=True)
@@ -148,7 +167,7 @@ def _call_streaming(key: str, body: dict) -> str:
     stop = None
     completed = False
     try:
-        r = urllib.request.urlopen(req, timeout=120)
+        r = urllib.request.urlopen(req, timeout=300)   # idle limit; a model may think silently for a while
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:400]
         raise RuntimeError(f"API {e.code} for model {body.get('model')}: {detail}") from None
@@ -222,16 +241,7 @@ def generate_engine(rulebook: str) -> str:
         "messages": [{"role": "user", "content": PROMPT.format(
             spec=ENGINE_SPEC, rulebook=rulebook[:120_000])}],
     }
-    last = None
-    for attempt in range(3):
-        try:
-            code = _call_streaming(key, body).strip()
-            break
-        except (ConnectionResetError, TimeoutError, OSError) as e:
-            last = e
-            time.sleep(3 * (attempt + 1))
-    else:
-        raise RuntimeError(f"model call failed 3 times (network): {last}")
+    code = _call_streaming(key, body).strip()   # retries live inside
     if code.startswith("```"):
         code = code.split("\n", 1)[1].rsplit("```", 1)[0]
     if "def initial_state" not in code:
@@ -313,15 +323,36 @@ as STATED, and must not be raised again as an assumption, question, or gap.
 """
 
 
+def _parse_json_with_repair(key: str, body: dict, text: str, opener: str, closer: str):
+    """Parse the model's JSON; on failure, ask it once to repair its own
+    output (cheap), then give up with a readable error."""
+    def attempt(t):
+        start, end = t.find(opener), t.rfind(closer)
+        if start < 0 or end < 0:
+            raise ValueError("no JSON found")
+        return json.loads(t[start:end + 1])
+    try:
+        return attempt(text)
+    except (ValueError, json.JSONDecodeError) as e:
+        fix = dict(body)
+        fix["messages"] = body["messages"] + [
+            {"role": "assistant", "content": text[:60_000]},
+            {"role": "user", "content": f"That was not valid JSON ({e}). Return the same content as "
+                                        "strictly valid JSON only — escape quotes inside strings, no "
+                                        "trailing commas, no commentary."}]
+        text2 = _clean(_call_streaming(key, fix))
+        try:
+            return attempt(text2)
+        except (ValueError, json.JSONDecodeError) as e2:
+            raise RuntimeError(f"model returned unusable JSON twice ({e2})") from None
+
+
 def _json_call(key: str, prompt: str, max_tokens: int = 8000, role: str = "chore"):
     body = {"model": model_for(role), "max_tokens": max_tokens,
             "output_config": {"effort": effort_for(role)},
             "messages": [{"role": "user", "content": prompt}]}
     text = _clean(_call_streaming(key, body))
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end < 0:
-        raise RuntimeError("model did not return a JSON array")
-    return json.loads(text[start:end + 1])
+    return _parse_json_with_repair(key, body, text, "[", "]")
 
 
 def review_rules(rulebook: str) -> list[dict]:
@@ -558,10 +589,7 @@ def _json_obj_call(key: str, prompt: str, max_tokens: int = 16000, role: str = "
             "output_config": {"effort": effort_for(role)},
             "messages": [{"role": "user", "content": prompt}]}
     text = _clean(_call_streaming(key, body))
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < 0:
-        raise RuntimeError("model did not return a JSON object")
-    return json.loads(text[start:end + 1])
+    return _parse_json_with_repair(key, body, text, "{", "}")
 
 
 def restate_rules(rulebook: str) -> dict:

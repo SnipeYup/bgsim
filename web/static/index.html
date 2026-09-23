@@ -102,6 +102,7 @@
   .ans:hover{background:#EEF3EF} .ans .tag{display:block; font-size:12px; color:var(--ink-soft); margin-top:3px}
   .diff{font:11.5px/1.4 ui-monospace,Consolas,monospace; background:#1f2a24; color:#dfe6e1; padding:10px; border-radius:6px; max-height:420px; overflow:auto; white-space:pre}
   .dadd{color:#9be29b} .ddel{color:#ff9c9c} .dhunk{color:#8fc5ff}
+  .logs{margin-top:18px; opacity:.85} .logs summary{cursor:pointer}
   .decide{margin-top:6px; font-size:13px} .decide summary{cursor:pointer; color:var(--ink-soft)}
   .resolve{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; font-size:13px}
   .resolve .btn{padding:5px 9px; font-size:12.5px}
@@ -186,6 +187,11 @@ function showNew(){
     <div id="rbwrap">
       <label for="rb">Rulebook</label>
       <textarea id="rb" placeholder="Paste the full rules text here"></textarea>
+      <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--ink-soft)">Component tables (optional) — cards, tiles, anything with printed values your rules refer to but don't list</summary>
+        <div id="comps"></div>
+        <button class="btn" style="padding:4px 9px;font-size:12px;margin-top:6px" onclick="addCompRow()">+ add a table</button>
+        <div class="qq">If you skip this, the review will tell you which tables it needs.</div>
+      </details>
     </div>
     <p style="margin:14px 0 0"><button class="btn amber" onclick="createProject()">Add to the table</button></p>
     <p class="status err" id="newerr"></p>
@@ -197,10 +203,17 @@ function refreshShelf(){
   document.querySelectorAll('.shelf .project').forEach(b=>b.classList.remove('active'));
 }
 
+function addCompRow(){
+  const d = document.createElement('div'); d.className='comprow'; d.style.cssText='margin-top:8px';
+  d.innerHTML = `<input type="text" class="cname" placeholder="What is this table? e.g. development cards" style="width:100%">
+    <textarea class="ctext" rows="4" placeholder="Header row, then one row per item (CSV or tab-separated)" style="width:100%;margin-top:4px;font:12px ui-monospace,Consolas,monospace"></textarea>`;
+  $('#comps').appendChild(d);
+}
 async function createProject(){
   try{
+    const components = [...document.querySelectorAll('.comprow')].map(r=>({name:r.querySelector('.cname').value, text:r.querySelector('.ctext').value})).filter(c=>c.name.trim()&&c.text.trim());
     const p = await api('/projects', {name:$('#nm').value,
-      builtin:$('#bi').value||null, rulebook:$('#rb')? $('#rb').value:''});
+      builtin:$('#bi').value||null, rulebook:$('#rb')? $('#rb').value:'', components});
     refresh(p.id);
   }catch(e){ $('#newerr').textContent = e.message; }
 }
@@ -218,14 +231,12 @@ function refresh0(p){
     <h2 class="display" style="margin:0">${p.name} <button class="btn" style="padding:3px 9px;font-size:12px;background:var(--alert);vertical-align:middle" onclick="deleteProject('${p.id}','${esc(p.name).replace(/'/g,"\\'")}')">Delete game</button></h2>
     ${p.complexity ? `<p class="status">${p.complexity.tier==='heavy'?'Heavy game':'Light game'} (score ${p.complexity.score}: ${p.complexity.words.toLocaleString()} words, ${p.complexity.actions} actions) · model spend $${(p.spend_usd||0).toFixed(2)} of $${p.complexity.budget_usd.toFixed(0)} budget
       <button class="btn" style="padding:2px 7px;font-size:11px;margin-left:6px" onclick="setBudget('${p.id}',${p.complexity.budget_usd})">change</button></p>` : (p.spend_usd?`<p class="status">model spend $${p.spend_usd.toFixed(2)}</p>`:'')}
-    ${renderSpend(p)}
     <div id="running"></div>
     <p class="status" id="engstat">${
       p.builtin ? 'Engine: built-in '+p.builtin :
       p.engine==='generated' ? 'Engine: generated · '+(p.validation||'') :
       'No engine yet.'}</p>
     ${!p.builtin ? renderReview(p) : ''}
-    ${!p.builtin ? renderVersions(p) : ''}
     ${!p.builtin ? renderInbox(p) : ''}
     ${!p.builtin && p.workshop && p.workshop.readiness===100 && !p.last_run ?
       `<p><button class="btn amber" onclick="runAll('${p.id}', this)">Run everything — build, audit, second opinion, jury, report (~$1.50)</button> <span class="status" style="display:inline">You can leave; questions wait in the inbox.</span></p>`:''}
@@ -241,6 +252,7 @@ function refresh0(p){
       <div class="go"><button class="btn amber" onclick="runSim('${p.id}', this)">Run the games</button></div>
     </div>
     <div id="quality"></div>
+    ${renderLogs(p)}
     <p class="status" id="simstat"></p>
     <div class="pad" id="pad"></div>
   </div>`;
@@ -281,6 +293,7 @@ function renderWorkshop(p){
       ${i.assumption?`<div class="qq">The model assumed: <i>${esc(i.assumption)}</i></div>`:''}
       ${i.quote?`<div class="qq">From your rules: "${esc(i.quote)}"</div>`:''}
       <div class="resolve">
+        <span class="status" id="ws-${i.id}" style="margin:0;flex-basis:100%"></span>
         ${i.assumption?`<button class="btn" onclick="wsAnswer('${p.id}','${i.id}','',true)">That's right</button>`:''}
         <input type="text" id="ws-${i.id}" placeholder="${i.assumption?'or correct it in your words':'your answer'}" style="flex:1;min-width:180px">
         <button class="btn amber" onclick="wsAnswer('${p.id}','${i.id}',$('#ws-${i.id}').value,false)">Save</button>
@@ -300,16 +313,22 @@ function renderWorkshop(p){
     ${DEV && ws.pass>=5 ? `<button class="btn" style="padding:4px 8px;font-size:12px" onclick="wsResetPasses('${p.id}')">Reset passes (dev)</button>`:''}</p></div>`;
 }
 async function runWorkshop(id, btn){ await fromButton(btn, 'Workshop', ()=>api('/projects/'+id+'/workshop', {})); }
-async function wsAnswer(id, item, answer, confirm){
-  const st = $('#engstat');
-  try{ await api('/projects/'+id+'/workshop/answer', {item_id:item, answer, confirm}); open(id); }
-  catch(e){ st.className='status err'; st.textContent=e.message; }
+function wsBusy(item, on, msg){
+  const st = document.getElementById('ws-'+item); if(!st) return;
+  const box = st.closest('.item'); if(box) box.querySelectorAll('button,input').forEach(b=>b.disabled=on);
+  st.className = 'status'; st.innerHTML = on ? `<span class="spin"></span>${msg||'Saving…'}` : '';
 }
+async function wsCall(id, item, path, payload){
+  wsBusy(item, true);
+  try{ await api('/projects/'+id+path, payload); open(id); }
+  catch(e){ wsBusy(item, false); const st = document.getElementById('ws-'+item); if(st){ st.className='status err'; st.textContent=e.message; } else alert(e.message); }
+}
+async function wsAnswer(id, item, answer, confirm){ await wsCall(id, item, '/workshop/answer', {item_id:item, answer, confirm}); }
 async function wsUndo(id, item){ await api('/projects/'+id+'/workshop/undo', {item_id:item}); open(id); }
 async function inboxUndo(id, item){ const m = await api('/projects/'+id+'/inbox/undo', {item_id:item}); if(m.undo_note) alert(m.undo_note); open(id); }
-async function wsDismiss(id, item){ await api('/projects/'+id+'/workshop/dismiss', {item_id:item}); open(id); }
+async function wsDismiss(id, item){ await wsCall(id, item, '/workshop/dismiss', {item_id:item}); }
 async function wsResetPasses(id){ await api('/projects/'+id+'/workshop/reset-passes', {}); open(id); }
-async function wsSkip(id, item){ await api('/projects/'+id+'/workshop/skip', {item_id:item}); open(id); }
+async function wsSkip(id, item){ return wsCall(id, item, '/workshop/skip', {item_id:item}); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 async function runReview(id){
   const st = $('#engstat');
@@ -330,35 +349,36 @@ function renderCheckers(p){
   const rows = c.map(x=>{
     if(!x.n_findings) return `<div class="qrow pass"><span class="qi">&#10003;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — checked, no problems${x.gaps.length?` <span class="qq" style="display:inline">(couldn't verify part of it: ${esc(x.gaps[0].replace(/^SCHEMA GAP:\s*/,''))})</span>`:''}</span></div>`;
     const q = qs[x.name];
+    const sid = 'fs-'+x.name;
+    if(x.decision && !x.applied){
+      const label = {sim_right:'you ruled: the simulation is right', auditor_right:'you ruled: the auditor is right — fix', answer:'your answer: '+esc(x.note), rulebook:'clarification added', engine:'fix the simulation', auditor:'dismiss the auditor'}[x.decision];
+      return `<div class="qrow"><span class="qi">&#8230;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${label} <button class="btn" style="padding:2px 7px;font-size:11px" onclick="findingUndecide('${p.id}','${x.name}')">undo</button></span></div>`;
+    }
     const body = q ? `<div class="qq"><b>What the simulated players did:</b> ${esc(q.simulation_did||q.what_happened||'')}<br>
                      <b>Your rule it concerns:</b> "${esc(q.rule)}"</div>`
                    : `<div class="qq">${x.findings.slice(0,3).map(esc).join('<br>')}</div>`;
     const where = x.games_total ? `seen in ${x.games_hit} of ${x.games_total} games` : `${x.n_findings} finding(s)`;
-    const verdicts = (p.jury_trail||[]).filter(e=>e.auditor===x.name);
-    const juried = verdicts.length > 0;
-    const sid = 'fs-'+x.name;
     const answers = q && q.answer_if_simulation_right ? `
         <div class="qq" style="margin-top:8px"><b>The question that decides it:</b> ${esc(q.question)}</div>
         <div class="answers">
-          <button class="ans" onclick="findingAct('${p.id}','${x.name}','sim_right')">${esc(q.answer_if_simulation_right)}<span class="tag">→ the simulation is right</span></button>
-          <button class="ans" onclick="findingAct('${p.id}','${x.name}','auditor_right')">${esc(q.answer_if_auditor_right)}<span class="tag">→ the auditor is right, fix the simulation</span></button>
+          <button class="ans" onclick="findingDecide('${p.id}','${x.name}','sim_right')">${esc(q.answer_if_simulation_right)}<span class="tag">→ the simulation is right</span></button>
+          <button class="ans" onclick="findingDecide('${p.id}','${x.name}','auditor_right')">${esc(q.answer_if_auditor_right)}<span class="tag">→ the auditor is right, fix the simulation</span></button>
         </div>` : '';
-    const buttons = juried ? `<div class="resolve">Jury: ${esc(verdicts[verdicts.length-1].verdict)}${/queued/.test(verdicts[verdicts.length-1].verdict)?' — see the inbox above.':''}</div>` :
-      `${answers}
-       <div class="resolve" id="${sid}-btns"><span class="status" id="${sid}" style="margin:0"></span></div>
+    return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${where}${body}${answers}
+       <div class="resolve"><span class="status" id="${sid}" style="margin:0"></span></div>
        <div class="resolve">Neither — the correct rule is:
           <input type="text" id="${sid}-ans" placeholder="write the rule in your own words" style="flex:1;min-width:220px">
-          <button class="btn amber" onclick="findingAct('${p.id}','${x.name}','answer')">Use my answer</button>
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','rulebook')">My rulebook doesn't cover this</button>
+          <button class="btn amber" onclick="findingDecide('${p.id}','${x.name}','answer')">Use my answer</button>
+          <button class="btn" onclick="findingDecide('${p.id}','${x.name}','rulebook')">My rulebook doesn't cover this</button>
        </div>
        <details class="decide"><summary>Just decide without answering</summary><div class="resolve">
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','engine')">Fix the simulation</button>
-          <button class="btn" onclick="findingAct('${p.id}','${x.name}','auditor')">Dismiss the auditor</button></div></details>`;
-    return `<div class="qrow flag"><span class="qi">&#9888;</span><span><b>${esc(x.name.replace(/_/g,' '))}</b> — ${where}${body}${buttons}</span></div>`;
+          <button class="btn" onclick="findingDecide('${p.id}','${x.name}','engine')">Fix the simulation</button>
+          <button class="btn" onclick="findingDecide('${p.id}','${x.name}','auditor')">Dismiss the auditor</button></div></details></span></div>`;
   }).join('');
   return `<div class="stage"><b>3 · Rule checks</b> — ${c.length} auditor(s) over ${p.checkers_games} games: ${total? total+' finding(s), your call below':'all clean'}${p.fix_rounds?` · ${p.fix_rounds} fix round(s)`:''}${p.needs_regeneration?' · <b>rules changed — rebuild the engine</b>':''}
     ${rows}
-    ${total && !c.every(x=>!x.n_findings || (p.jury_trail||[]).some(e=>e.auditor===x.name)) ? `<p class="resolve"><button class="btn amber" onclick="runJury('${p.id}', this)">Let the jury decide all ${c.filter(x=>x.n_findings).length} finding(s) (one run, ~$${(0.05*c.filter(x=>x.n_findings).length+0.4).toFixed(2)} if a fix is needed)</button> <span class="status" id="fs-__all__" style="margin:0"></span></p>` : ''}
+    ${(()=>{ const pend = c.filter(x=>x.decision && !x.applied).length; return pend ? `<p class="resolve"><b>${pend} decision(s) recorded.</b> <button class="btn amber" onclick="stageJob('${p.id}','/checkers/apply','Applying your decisions', this)">Apply ${pend} decision(s) — one fix, one re-audit</button></p>` : ''; })()}
+    ${total && !c.every(x=>!x.n_findings || x.decision || (p.jury_trail||[]).some(e=>e.auditor===x.name)) ? `<p class="resolve"><button class="btn amber" onclick="runJury('${p.id}', this)">Let the jury decide all ${c.filter(x=>x.n_findings).length} finding(s) (one run, ~$${(0.05*c.filter(x=>x.n_findings).length+0.4).toFixed(2)} if a fix is needed)</button> <span class="status" id="fs-__all__" style="margin:0"></span></p>` : ''}
     <p><button class="btn" style="padding:6px 10px;font-size:13px" onclick="rerunCheckers('${p.id}', this)">Re-audit</button></p></div>`;
 }
 let BUSY = false;
@@ -372,6 +392,16 @@ async function fromButton(btn, verb, start){
   try{ const job = await start(); await watch(job.id, st, verb); BUSY=false; open(current); }
   catch(e){ st.className='status err'; st.textContent=e.message; if(btn) btn.disabled=false; BUSY=false; }
 }
+async function findingDecide(id, name, decision){
+  const st = document.getElementById('fs-'+name); const row = st ? st.closest('.qrow') : null;
+  let note = '';
+  if(decision==='rulebook'){ note = prompt('Write the clarification in your own words — it gets added to your rulebook:'); if(note===null) return; }
+  if(decision==='answer'){ note = document.getElementById('fs-'+name+'-ans').value; if(!note.trim()){ st.textContent='Type the answer first.'; return; } }
+  if(row) row.querySelectorAll('button,input').forEach(b=>b.disabled=true);
+  try{ await api('/projects/'+id+'/checkers/decide', {name, decision, note}); open(id); }
+  catch(e){ if(row) row.querySelectorAll('button,input').forEach(b=>b.disabled=false); st.className='status err'; st.textContent=e.message; }
+}
+async function findingUndecide(id, name){ await api('/projects/'+id+'/checkers/undecide', {name, decision:'x', note:''}); open(id); }
 async function findingAct(id, name, decision){
   if(BUSY){ alert('Something is already running on this game — wait for it to finish.'); return; }
   const st = document.getElementById('fs-'+name);
@@ -406,7 +436,7 @@ function resolveRulebook(id, name){
 function renderInbox(p){
   const inbox = p.inbox || []; const open = inbox.filter(i=>i.status==='open');
   const trail = p.jury_trail || [];
-  if(!inbox.length && !trail.length) return '';
+  if(!inbox.length) return '';
   const q = i => `<div class="rq"><b>${esc(i.question)}</b><div class="qq">${esc(i.scenario)}</div>
     <div class="qq">The simulation did: <b>${esc(i.engine_value)}</b> · the auditor expected: <b>${esc(i.auditor_value)}</b>${i.proxy_note?` · rules expert: ${esc(i.proxy_note)}`:''}</div>
     <div class="qq">Meanwhile the report assumes: ${esc(i.provisional)}</div>
@@ -416,22 +446,16 @@ function renderInbox(p){
   return `<div class="stage inbox"><b>Inbox</b> — ${open.length? open.length+' question(s) only you can answer' : 'no open questions'}
     ${open.map(q).join('')}
     ${done.length?`<details><summary>${done.length} settled</summary>${done.map(i=>`<div class="qq">${esc(i.question)} → <b>${esc(i.answer)}</b> · ${esc(i.outcome||'')} <button class="btn" style="padding:2px 7px;font-size:11px" onclick="inboxUndo('${p.id}','${i.id}')">Undo</button></div>`).join('')}</details>`:''}
-    ${trail.length?`<details><summary>Jury trail — ${trail.length} automatic decision(s)</summary>${trail.map(e=>`<div class="qq"><b>${esc(e.auditor)}</b>: ${esc(e.verdict)}${e.proxy&&e.proxy.quote?` · "${esc(e.proxy.quote)}"`:''}</div>`).join('')}</details>`:''}
   </div>`;
 }
 async function inboxAnswer(id, item, btn){
   const a = $('#ib-'+item).value;
   if(!a.trim()){ alert('Write the answer first.'); return; }
-  if(BUSY){ alert('Something is already running on this game — wait for it to finish.'); return; }
   const st = document.createElement('span'); st.className='status'; st.style.cssText='margin-left:8px';
-  st.innerHTML = '<span class="spin"></span>Comparing your answer…';
+  st.innerHTML = '<span class="spin"></span>Saving…';
   if(btn){ btn.disabled = true; btn.insertAdjacentElement('afterend', st); }
-  BUSY = true;
-  try{ const r = await api('/projects/'+id+'/inbox/answer', {item_id:item, answer:a});
-       if(r.job){ await watch(r.job.id, st, 'Applying your answer'); }
-       else { st.className='status ok'; st.textContent='Your answer matches what the simulation already does — saved.'; await new Promise(r=>setTimeout(r,1200)); }
-       BUSY=false; open(id); }
-  catch(e){ st.className='status err'; st.textContent=e.message; if(btn) btn.disabled=false; BUSY=false; }
+  try{ await api('/projects/'+id+'/inbox/answer', {item_id:item, answer:a}); open(id); }
+  catch(e){ st.className='status err'; st.textContent=e.message; if(btn) btn.disabled=false; }
 }
 async function setBudget(id, cur){
   const v = prompt('Model spend budget for this game, in dollars:', cur);
@@ -467,6 +491,17 @@ async function uploadComponent(id, name, taId, btn){
 async function waiveComponent(id, name){ await api('/projects/'+id+'/components/waive', {item_id:name}); open(id); }
 async function unwaiveComponent(id, name){ await api('/projects/'+id+'/components/unwaive', {item_id:name}); open(id); }
 async function dropComponent(id, name){ if(!confirm('Remove this table? The engine will need rebuilding.')) return; await api('/projects/'+id+'/components/'+encodeURIComponent(name), null, 'DELETE'); open(id); }
+function renderLogs(p){
+  const inbox = p.inbox||[], trail = p.jury_trail||[];
+  const done = inbox.filter(i=>i.status!=='open');
+  const parts = [];
+  if(trail.length) parts.push(`<details><summary>Jury trail — ${trail.length} automatic decision(s)</summary>${trail.map(e=>`<div class="qq"><b>${esc(e.auditor)}</b>: ${esc(e.verdict)}</div>`).join('')}</details>`);
+  if(done.length) parts.push(`<details><summary>Inbox history — ${done.length} settled</summary>${done.map(i=>`<div class="qq">${esc(i.question)} → <b>${esc(i.answer)}</b> · ${esc(i.outcome|| (i.applied?'':'saved, not applied yet'))} <button class="btn" style="padding:2px 7px;font-size:11px" onclick="inboxUndo('${p.id}','${i.id}')">Undo</button></div>`).join('')}</details>`);
+  const sp = renderSpend(p); if(sp) parts.push(sp);
+  const vs = renderVersions(p); if(vs) parts.push(vs);
+  if(!parts.length) return '';
+  return `<details class="stage logs"><summary><b>Logs</b> — history, decisions, spend, versions</summary>${parts.join('')}</details>`;
+}
 function renderSpend(p){
   const L = p.spend_ledger||[]; if(!L.length) return '';
   const byStage = {}; for(const e of L){ const k=e.stage.split(':')[0]; byStage[k]=(byStage[k]||0)+e.usd; }

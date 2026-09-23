@@ -89,6 +89,21 @@ def audit(path: str, checker_dir: str, n_games: int, specs_by_seed):
     return results, {n: len(s) for n, s in games_hit.items()}
 
 
+def signature(path: str, n_games: int = 12, players=(2, 3)):
+    """A fingerprint of observable behaviour: per seeded game, the number of
+    turns and the final scores. Two engines with the same fingerprint play the
+    same games — a 'fix' that leaves it unchanged changed nothing that matters."""
+    from bgsim.agents import make_agent
+    from bgsim.engine import play_game
+    game = load_engine(path)
+    out = []
+    for n in players:
+        for seed in range(n_games):
+            rec = play_game(game, [make_agent("random", seed * 10 + i) for i in range(n)], seed)
+            out.append((n, seed, rec.n_turns, [tuple(sc) if isinstance(sc, (tuple, list)) else sc for sc in rec.scores]))
+    return out
+
+
 def schema(path: str):
     from bgsim.trace import record_trace, print_schema
     return print_schema(record_trace(load_engine(path), ["random", "random"], 2, 0))
@@ -104,7 +119,7 @@ def second(path_a: str, path_b: str, n_games: int = 150):
     return second_opinion(load_engine(path_a), load_engine(path_b), n_games=n_games)
 
 
-TASKS = {"validate": validate, "play": play, "audit": audit, "schema": schema,
+TASKS = {"validate": validate, "play": play, "audit": audit, "schema": schema, "signature": signature,
          "quality": quality, "second": second}
 
 

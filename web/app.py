@@ -198,6 +198,7 @@ class NewProject(BaseModel):
     name: str
     rulebook: str = ""
     builtin: str | None = None  # "splendor" | "agricola"
+    components: list[dict] = []  # optional [{"name": ..., "text": ...}] tables given up front
 
 
 BUDGET_USD = {"light": 8.0, "heavy": 15.0}   # per-project model spend guard
@@ -279,6 +280,10 @@ def create_project(req: NewProject):
     _save(meta)
     if req.rulebook.strip():
         (DATA / pid / "rulebook.txt").write_text(req.rulebook, encoding="utf-8")
+    for comp in req.components:
+        name, text = str(comp.get("name", "")).strip(), str(comp.get("text", "")).strip()
+        if name and "\n" in text:
+            upload_component(pid, ComponentUpload(name=name, text=text))
     return meta
 
 
@@ -496,7 +501,12 @@ def run_workshop(pid: str):
         # gatekeeper: one cheap pass classifies every candidate before the designer sees it
         j["detail"] = "checking which items are real rules questions"
         qs = [(it["assumption"] or it["text"]) if it["source"] != "review" else it["text"] for it in items]
-        triage = llm.triage_questions(rulebook, qs) if qs else []
+        try:
+            triage = llm.triage_questions(rulebook, qs) if qs else []
+        except Exception as e:   # the gatekeeper is a convenience, never a reason to lose the pass
+            print(f"gatekeeper failed, showing all items: {e}", file=sys.stderr)
+            triage = [{"kind": "gap", "answered": False, "answer": "", "quote": ""} for _ in qs]
+            ws["gatekeeper_note"] = "the automatic filter failed this pass, so every item is shown"
         auto = 0
         gate_labels = {"example": "(example choice, not a rule)", "design": "(design question, not a rule)",
                        "duplicate": "(duplicate of another item)"}
@@ -590,6 +600,12 @@ def workshop_answer(pid: str, req: WorkshopAnswer):
     if req.confirm and not req.answer.strip():
         if not it.get("assumption"):
             raise HTTPException(400, "nothing to confirm — type an answer")
+    if req.answer.strip():
+        import difflib
+        q = (it.get("text") or "").strip().lower(); ans = req.answer.strip().lower()
+        # only a near-verbatim restatement, or something phrased as a question, is refused
+        if ans.endswith("?") or (q and difflib.SequenceMatcher(None, q, ans).ratio() > 0.95):
+            raise HTTPException(400, "that's the question again, not an answer — state what the rule is")
         it["status"] = "confirmed"; it["answer"] = it["assumption"]
     elif req.answer.strip():
         it["status"] = "answered"; it["answer"] = req.answer.strip()
@@ -858,6 +874,98 @@ class Resolution(BaseModel):
     note: str = ""            # clarification text when decision == "rulebook"
 
 
+@app.post("/api/projects/{pid}/checkers/decide")
+def checkers_decide(pid: str, req: Resolution):
+    """Record the designer's decision on a finding without running anything.
+    'Apply decisions' later takes them all in one repair + one re-audit."""
+    meta = _load(pid)
+    entry = next((c for c in meta.get("checkers") or [] if c["name"] == req.name), None)
+    if not entry:
+        raise HTTPException(404, "no such auditor")
+    if req.decision not in ("sim_right", "auditor_right", "answer", "rulebook", "engine", "auditor"):
+        raise HTTPException(400, "unknown decision")
+    if req.decision in ("answer", "rulebook") and not req.note.strip():
+        raise HTTPException(400, "write it first")
+    q = meta.get("checker_questions", {}).get(req.name, {})
+    entry["decision"] = req.decision; entry["note"] = req.note.strip(); entry["applied"] = False
+    # the designer's statement of the rule goes into the rulebook straight away
+    stmt = {"sim_right": q.get("answer_if_simulation_right", ""),
+            "auditor_right": q.get("answer_if_auditor_right", ""),
+            "answer": req.note.strip(), "rulebook": req.note.strip()}.get(req.decision, "")
+    if stmt:
+        _set_clarification(pid, meta, f"finding:{req.name}", q.get("question") or entry["rule"], stmt)
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/checkers/undecide")
+def checkers_undecide(pid: str, req: Resolution):
+    meta = _load(pid)
+    entry = next((c for c in meta.get("checkers") or [] if c["name"] == req.name), None)
+    if not entry or entry.get("applied"):
+        raise HTTPException(400, "nothing to undo")
+    entry.pop("decision", None); entry.pop("note", None); entry.pop("applied", None)
+    _drop_clarification(pid, meta, f"finding:{req.name}")
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/checkers/apply")
+def checkers_apply(pid: str):
+    """Take every decided-but-unapplied finding: dismiss the auditors the
+    designer ruled against, and fix the engine ONCE for everything else."""
+    meta = _load(pid)
+    pending = [c for c in meta.get("checkers") or [] if c.get("decision") and not c.get("applied")]
+    if not pending:
+        raise HTTPException(400, "no decisions to apply")
+    cdir = DATA / pid / "checkers"
+    job = _job("fix", pid)
+
+    def work(j):
+        m = _load(pid)
+        to_fix, dismissed = [], []
+        for c in [c for c in m.get("checkers") or [] if c.get("decision") and not c.get("applied")]:
+            d = c["decision"]
+            if d == "answer":   # the designer stated a fact: work out who it sides with
+                j["detail"] = f"comparing your answer for {c['name']}"
+                g = _engine_for(m)
+                ctx = _moment_context(g, c["findings"][0]) if c["findings"] else ""
+                fr = llm.frame_finding(c["name"], c["rule"], c["findings"], ctx)
+                side = llm.compare_answer(fr["engine_value"], fr["auditor_value"], c["note"])
+                d = "sim_right" if side == "A" else "auditor_right"
+                c["resolved_as"] = d
+            c["applied"] = True
+            if d in ("sim_right", "auditor"):
+                dismissed.append(c["name"])
+                f = cdir / f"{c['name']}.py"
+                if f.exists():
+                    f.rename(cdir / f"_{c['name']}.py")
+                m.setdefault("retired_auditors", []).append(c["name"])
+                m.setdefault("jury_trail", []).append({"auditor": c["name"], "time": time.time(),
+                    "verdict": "you ruled for the simulation — auditor dismissed"})
+            else:
+                to_fix.append(c)
+        m["checkers"] = [c for c in m["checkers"] if c["name"] not in dismissed]
+        _save(m)
+        if not to_fix:
+            return
+        reason = "The designer has ruled on these; fix ALL of them:\n"
+        findings = []
+        for c in to_fix:
+            stmt = c.get("note") or m.get("checker_questions", {}).get(c["name"], {}).get("answer_if_auditor_right", "")
+            reason += f"\n[{c['name']}] rule: {c['rule']}\n  designer's ruling: {stmt or 'the auditor is right'}"
+            findings += c["findings"][:6]
+        _repair_and_reaudit(pid, m, j, reason, findings, ", ".join(c["name"] for c in to_fix))
+        m = _load(pid)
+        for c in to_fix:
+            m.setdefault("jury_trail", []).append({"auditor": c["name"], "time": time.time(),
+                "verdict": "you ruled against the simulation — fixed"})
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
 @app.post("/api/projects/{pid}/checkers/resolve")
 def resolve_finding(pid: str, req: Resolution):
     """The designer's verdict on an auditor's finding routes the fix."""
@@ -899,24 +1007,10 @@ def resolve_finding(pid: str, req: Resolution):
         findings = entry["findings"]
 
         def work(j):
-            rulebook = _rulebook_for_model(pid)
-            code = (DATA / pid / "game.py").read_text(encoding="utf-8")
-            error = (f"An independent auditor of the rule '{entry['rule']}' reports these "
-                     f"violations, and the designer has confirmed the engine is wrong:\n"
-                     + "\n".join(findings[:25]))
-            j["detail"] = f"fixing the engine for '{req.name}'"
-            new_code = llm.repair_engine(rulebook, code, error)
-            _write_engine(pid, new_code, f"fixed: {req.name}")
-            j["detail"] = "re-validating"
-            _err = _validate_file(pid, players=(2,))
-            if _err:
-                raise RuntimeError("the fixed engine fails validation:\n" + _err)
-            game = _engine_for(meta)
-            j["detail"] = "re-auditing"
-            m2 = _load(pid)
-            run_checkers(m2, game, cdir)
-            m2["fix_rounds"] = m2.get("fix_rounds", 0) + 1
-            _save(m2)
+            _repair_and_reaudit(pid, meta, j, (
+                f"An independent auditor of the rule '{entry['rule']}' reports these "
+                "violations, and the designer has confirmed the engine is wrong:"),
+                findings, req.name)
 
         _run_in_thread(job, work)
         return job
@@ -1011,17 +1105,47 @@ def _wait_job(jid: str, timeout: float = 3600, parent: dict | None = None) -> di
     return JOBS[jid]
 
 
+def _signature(pid: str, filename: str = "game.py"):
+    try:
+        return sandbox.run("signature", timeout=240, path=str(DATA / pid / filename))
+    except Exception:
+        return None
+
+
 def _repair_and_reaudit(pid: str, meta: dict, j: dict, reason: str, findings: list[str], label: str):
+    """Repair, then prove the repair did something: replay the same seeded
+    games before and after. An unchanged fingerprint means a no-op fix; retry
+    once with the failure spelled out and the stronger model."""
     rulebook = _rulebook_for_model(pid)
     code = (DATA / pid / "game.py").read_text(encoding="utf-8")
     error = reason + "\n" + "\n".join(findings[:25])
-    j["detail"] = f"fixing the engine: {label}"
-    new_code = llm.repair_engine(rulebook, code, error)
-    _write_engine(pid, new_code, f"fixed: {label}")
-    j["detail"] = "re-validating"
-    _err = _validate_file(pid, players=(2,))
-    if _err:
-        raise RuntimeError("the fixed engine fails validation:\n" + _err)
+    j["detail"] = "recording how the engine plays before the fix"
+    before = _signature(pid)
+    for attempt in range(2):
+        j["detail"] = f"fixing the engine: {label}" + (" (second attempt, stronger model)" if attempt else "")
+        new_code = llm.repair_engine(rulebook, code, error, escalate=bool(attempt))
+        _write_engine(pid, new_code, f"fixed: {label}" + (" (2nd attempt)" if attempt else ""))
+        j["detail"] = "re-validating"
+        _err = _validate_file(pid, players=(2,))
+        if _err:
+            raise RuntimeError("the fixed engine fails validation:\n" + _err)
+        after = _signature(pid)
+        if before is None or after is None or after != before:
+            break
+        # nothing observable changed: tell the model exactly that and try once more
+        _write_engine(pid, code, f"reverted: '{label}' fix changed nothing observable")
+        j["detail"] = "the fix changed nothing observable — retrying"
+        error = (reason + "\n\nYOUR PREVIOUS FIX CHANGED NOTHING: the same seeded games played out "
+                 "identically (same turn counts, same final scores) before and after it. The rule "
+                 "is still not enforced in play. Make sure the change reaches legal_actions/apply/"
+                 "is_terminal — the code paths that decide what actually happens — not just a flag.\n"
+                 + "\n".join(findings[:25]))
+    else:
+        m0 = _load(pid)
+        m0.setdefault("jury_trail", []).append({"auditor": label, "time": time.time(),
+            "verdict": "two repair attempts changed nothing observable — the engine was left as it was; "
+                       "this needs a look"})
+        _save(m0)
     game = _engine_for(meta)
     j["detail"] = "re-auditing"
     m2 = _load(pid)
@@ -1087,26 +1211,12 @@ def run_jury(pid: str, j: dict) -> None:
         meta["jury_trail"] = trail; meta["inbox"] = inbox; _save(meta)
     if to_fix:
         # one repair covering every confirmed violation, one validation, one re-audit
-        rulebook = _rulebook_for_model(pid)
-        code = (DATA / pid / "game.py").read_text(encoding="utf-8")
         reason = ("Independent auditors and an independent rules expert (reading the rulebook only) "
                   "agree the engine is wrong on these points; fix ALL of them:\n")
         for c, px in to_fix:
             reason += (f"\n[{c['name']}] expert: {px['answer']} (\"{px['quote']}\")\n  " +
                        "\n  ".join(c["findings"][:6]))
-        j["detail"] = f"fixing the engine for {len(to_fix)} confirmed violation(s)"
-        new_code = llm.repair_engine(rulebook, code, reason)
-        _write_engine(pid, new_code, "fixed: " + ", ".join(c["name"] for c, _ in to_fix))
-        j["detail"] = "re-validating"
-        _err = _validate_file(pid, players=(2,))
-        if _err:
-            raise RuntimeError("the fixed engine fails validation:\n" + _err)
-        game = _engine_for(_load(pid))
-        j["detail"] = "re-auditing once"
-        m2 = _load(pid)
-        run_checkers(m2, game, DATA / pid / "checkers")
-        m2["fix_rounds"] = m2.get("fix_rounds", 0) + 1
-        _save(m2)
+        _repair_and_reaudit(pid, _load(pid), j, reason, [], ", ".join(c["name"] for c, _ in to_fix))
         fixes = len(to_fix)
     m = _load(pid)
     m["jury_trail"] = trail; m["inbox"] = inbox; m["jury_fixes"] = m.get("jury_fixes", 0) + fixes
@@ -1131,46 +1241,61 @@ class InboxAnswer(BaseModel):
 
 @app.post("/api/projects/{pid}/inbox/answer")
 def inbox_answer(pid: str, req: InboxAnswer):
-    """Designer settles a queued question. The answer becomes a clarification;
-    if it overturns the provisional ruling, the engine is fixed and re-audited."""
+    """Designer settles a queued question. The answer is saved as a
+    clarification straight away; nothing runs. 'Apply answers' later takes
+    every pending answer in one repair + one re-audit."""
     meta = _load(pid)
     it = next((i for i in meta.get("inbox", []) if i["id"] == req.item_id), None)
     if not it:
         raise HTTPException(404, "no such question")
     if not req.answer.strip():
         raise HTTPException(400, "write the answer first")
-    if _running_for(pid):
-        b = _running_for(pid)[0]
-        raise HTTPException(409, f"'{b['kind']}' is still running on this game ({b.get('detail') or 'working'}) — "
-                                 "your answer wasn't applied; try again when it finishes")
-    side = llm.compare_answer(it["engine_value"], it["auditor_value"], req.answer.strip())
-    it["status"] = "answered"; it["answer"] = req.answer.strip()
+    it["status"] = "answered"; it["answer"] = req.answer.strip(); it["applied"] = False
+    it.pop("outcome", None)
     _set_clarification(pid, meta, f"inbox:{it['id']}",
                        f"{it['question']} (scenario: {it['scenario']})", it["answer"])
-    if side == "A":
-        it["outcome"] = "matches what the engine did — nothing to change"
-        _save(meta)
-        return {"meta": meta, "job": None}
-    job = _job("fix", pid)   # lock checked above, so this cannot fail after the answer is saved
     _save(meta)
+    return {"meta": meta, "job": None}
+
+
+@app.post("/api/projects/{pid}/inbox/apply")
+def inbox_apply(pid: str):
+    """Take every answered-but-unapplied question: those agreeing with the
+    engine are closed; the rest go into ONE combined repair, then one
+    validation and one re-audit."""
+    meta = _load(pid)
+    pending = [i for i in meta.get("inbox", []) if i["status"] == "answered" and not i.get("applied")]
+    if not pending:
+        raise HTTPException(400, "no unapplied answers")
+    job = _job("fix", pid)
 
     def work(j):
         m = _load(pid)
-        entry = next(i for i in m["inbox"] if i["id"] == req.item_id)
-        entry["outcome"] = "overturned the provisional ruling — engine fixed"
+        overturned = []
+        for it in [i for i in m["inbox"] if i["status"] == "answered" and not i.get("applied")]:
+            j["detail"] = f"comparing your answer: {it['question'][:50]}"
+            side = llm.compare_answer(it["engine_value"], it["auditor_value"], it["answer"])
+            it["applied"] = True
+            if side == "A":
+                it["outcome"] = "matches what the engine did — nothing to change"
+            else:
+                it["outcome"] = "overturned the provisional ruling — engine fixed"
+                overturned.append(it)
         _save(m)
-        _repair_and_reaudit(pid, m, j, (
-            f"The designer has settled a rule: {it['question']} Scenario: {it['scenario']} "
-            f"Answer: {it['answer']}. The engine currently does: {it['engine_value']}."),
-            [], f"designer answer to {it['auditor']}")
-        # un-mark the auditor as undecided so it can be re-evaluated
+        if not overturned:
+            return
+        reason = "The designer has settled these rules; fix ALL of them:\n" + "\n".join(
+            f"- {it['question']} Scenario: {it['scenario']} Answer: {it['answer']}. "
+            f"The engine currently does: {it['engine_value']}." for it in overturned)
+        _repair_and_reaudit(pid, m, j, reason, [],
+                            "designer answers: " + ", ".join(it["auditor"] for it in overturned))
         m = _load(pid)
         for c in m.get("checkers") or []:
             c.pop("status", None)
         _save(m)
 
     _run_in_thread(job, work)
-    return {"meta": meta, "job": job}
+    return job
 
 
 @app.post("/api/projects/{pid}/inbox/undo")
@@ -1240,22 +1365,9 @@ def fix_from_findings(pid: str):
     job = _job("fix", pid)
 
     def work(j):
-        rulebook = _rulebook_for_model(pid)
-        code = (DATA / pid / "game.py").read_text(encoding="utf-8")
-        error = ("Independent rule auditors, written from the rulebook only, report "
-                 "these violations in games your engine played:\n" + "\n".join(findings[:25]))
-        j["detail"] = "asking the model to fix the engine from the auditors' findings"
-        code = llm.repair_engine(rulebook, code, error)
-        _write_engine(pid, code, "fixed from auditor findings")
-        j["detail"] = "re-validating"
-        _err = _validate_file(pid, players=(2,))
-        if _err:
-            raise RuntimeError("the fixed engine fails validation:\n" + _err)
-        game = _engine_for(meta)
-        j["detail"] = "re-auditing"
-        run_checkers(meta, game, DATA / pid / "checkers")
-        meta["fix_rounds"] = meta.get("fix_rounds", 0) + 1
-        _save(meta)
+        _repair_and_reaudit(pid, meta, j, (
+            "Independent rule auditors, written from the rulebook only, report "
+            "these violations in games your engine played:"), findings, "auditor findings")
 
     _run_in_thread(job, work)
     return job
