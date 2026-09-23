@@ -74,15 +74,25 @@ class H(BaseHTTPRequestHandler):
                 {"text": "Player 1 takes 3 wood from the Forest.", "assumption": ""},
                 {"text": "Player 2 plows a field next to their house.", "rule_gap": "whether the first field must be adjacent to the house"},
                 {"text": "Player 1 takes white, blue and green gems.", "rule_gap": ""}]}))
-        if "decide whether the rulebook text actually" in text:
+        if "You are the gatekeeper" in text:
             n = text.split("=== questions ===")[1].count("\n")
-            return self._stream_text(json.dumps([{"answered": True, "answer": "Exactly three; the text says 'three different colours'.", "quote": "three gem tokens of different colours"}] + [{"answered": False, "answer": "", "quote": ""}] * max(0, n - 1)))
+            qs = [q for q in text.split("=== questions ===")[1].strip().split("\n") if q.strip()]
+            out = []
+            for q in qs:
+                ql = q.lower()
+                if "fewer than 3" in ql or "three different" in ql: out.append({"kind": "answered", "answer": "Exactly three; the text says 'three different colours'.", "quote": "three gem tokens of different colours"})
+                elif "white, blue" in ql or "chose" in ql: out.append({"kind": "example", "answer": "", "quote": ""})
+                elif "acceptable" in ql or "guaranteed" in ql: out.append({"kind": "design", "answer": "", "quote": ""})
+                else: out.append({"kind": "gap", "answer": "", "quote": ""})
+            return self._stream_text(json.dumps(out))
         if "meticulous board game rules editor" in text:
             return self._stream_text(json.dumps([
                 {"kind": "ambiguous", "quote": "take 3 gem tokens of different colours",
                  "question": "May a player take fewer than 3 different tokens by choice?"},
                 {"kind": "missing", "quote": "End of the game",
-                 "question": "If two players tie on points and card count, who wins?"}]))
+                 "question": "If two players tie on points and card count, who wins?"},
+                {"kind": "ambiguous", "quote": "nobles", "question": "Is it acceptable that some noble sets are harder than others?"},
+                {"kind": "ambiguous", "quote": "", "question": "Assumed Player A chose white, blue and green specifically."}]))
         if "You explain a disagreement about a board game" in text:
             import re
             names = re.findall(r"^\[(\w+)\]", text.split("=== auditors ===")[1], re.M)

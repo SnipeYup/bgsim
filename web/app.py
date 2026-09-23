@@ -36,6 +36,7 @@ from bgsim.agents import make_agent
 from bgsim.games import make_game
 from bgsim.sim import simulate
 from bgsim.trace import record_trace, print_schema
+from web import sandbox
 from bgsim.verify import load_checkers
 from web import llm
 from web.quality import quality_report, second_opinion
@@ -90,6 +91,17 @@ def _engine_for(meta: dict, filename: str = "game.py"):
         if isinstance(obj, type) and hasattr(obj, "initial_state"):
             return obj()
     raise HTTPException(500, "generated file has no engine class")
+
+
+def _validate_file(pid: str, filename: str = "game.py", players=(2, 3, 4), seeds: int = 12) -> str | None:
+    """Random games with invariants, in a killable child. None if clean, else
+    the failure text (a traceback, or the hang explanation)."""
+    if _load(pid).get("builtin"):
+        return None
+    try:
+        return sandbox.run("validate", timeout=240, path=str(DATA / pid / filename), players=players, seeds=seeds)
+    except sandbox.EngineHung as e:
+        return str(e)
 
 
 def _write_engine(pid: str, code: str, label: str) -> None:
@@ -362,18 +374,24 @@ def run_workshop(pid: str):
                               "text": st["text"], "assumption": st["assumption"], "quote": ""})
         j["detail"] = "looking for gaps and contradictions"
         review = llm.review_rules(rulebook)
-        j["detail"] = "checking which questions the rulebook already answers"
-        triage = llm.triage_questions(rulebook, [r["question"] for r in review])
+        for r in review:
+            items.append({"kind": r["kind"], "source": "review", "where": "", "text": r["question"],
+                          "assumption": "", "quote": r["quote"]})
+        # gatekeeper: one cheap pass classifies every candidate before the designer sees it
+        j["detail"] = "checking which items are real rules questions"
+        qs = [(it["assumption"] or it["text"]) if it["source"] != "review" else it["text"] for it in items]
+        triage = llm.triage_questions(rulebook, qs) if qs else []
         auto = 0
-        for r, t in zip(review, triage):
-            if t["answered"]:
+        gate_labels = {"example": "(example choice, not a rule)", "design": "(design question, not a rule)",
+                       "duplicate": "(duplicate of another item)"}
+        for it, t in zip(items, triage):
+            if t["kind"] == "answered":
                 auto += 1
-                items.append({"kind": r["kind"], "source": "review", "where": "", "text": r["question"],
-                              "assumption": t["answer"], "quote": t["quote"], "status": "auto",
-                              "answer": t["answer"]})
-            else:
-                items.append({"kind": r["kind"], "source": "review", "where": "", "text": r["question"],
-                              "assumption": "", "quote": r["quote"]})
+                it["status"] = "auto"; it["answer"] = t["answer"]; it["quote"] = t["quote"] or it.get("quote", "")
+                if it["source"] == "review":
+                    it["assumption"] = t["answer"]
+            elif t["kind"] in gate_labels:
+                it["status"] = "dismissed"; it["answer"] = gate_labels[t["kind"]]
         # ids + default status
         for k, it in enumerate(items):
             it.setdefault("status", "open")
@@ -571,7 +589,8 @@ def build_checkers(pid: str):
         cdir = DATA / pid / "checkers"
         cdir.mkdir(exist_ok=True)
         j["detail"] = "recording a sample game for the trace format"
-        schema = print_schema(record_trace(game, ["random", "random"], 2, 0))
+        schema = (print_schema(record_trace(game, ["random", "random"], 2, 0)) if meta.get("builtin")
+                  else sandbox.run("schema", timeout=120, path=str(DATA / pid / "game.py")))
         j["detail"] = "splitting the rulebook into auditable sections"
         sections = llm.plan_checkers(rulebook)
         for k, sec in enumerate(sections):
@@ -646,18 +665,17 @@ def _moment_context(game, finding: str) -> str:
         return f"(could not re-record the moment: {e})"
 
 
-def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
+def _audit_inprocess(game, cdir, n_games):
+    """Built-in engines are trusted to terminate; audit them in-process."""
     checkers = load_checkers(cdir)
-    results = {getattr(c, "NAME", c.__checker_file__): {"rule": getattr(c, "RULE", ""),
-               "gaps": [], "findings": []} for c in checkers}
-    specs_by_seed = SPECS_BY_SEED
-    games_hit = {n: set() for n in results}
+    names = [getattr(c, "NAME", c.__checker_file__) for c in checkers]
+    results = {n: {"rule": getattr(c, "RULE", ""), "gaps": [], "findings": []} for n, c in zip(names, checkers)}
+    hit = {n: set() for n in names}
     for seed in range(n_games):
         _check_cancel()
-        specs = specs_by_seed[seed % len(specs_by_seed)]
+        specs = SPECS_BY_SEED[seed % len(SPECS_BY_SEED)]
         tr = record_trace(game, specs, len(specs), 500 + seed)
-        for c in checkers:
-            name = getattr(c, "NAME", c.__checker_file__)
+        for name, c in zip(names, checkers):
             try:
                 msgs = c.check(tr) or []
             except Exception as e:
@@ -665,12 +683,25 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
             for m in msgs:
                 bucket = "gaps" if m.startswith("SCHEMA GAP") else "findings"
                 if bucket == "findings":
-                    games_hit[name].add(seed)
+                    hit[name].add(seed)
                 if m not in results[name][bucket]:
                     results[name][bucket].append(m if bucket == "gaps" else f"game {seed}: {m}")
+    return results, {n: len(v) for n, v in hit.items()}
+
+
+def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
+    if meta.get("builtin"):
+        path = None
+    else:
+        path = str(DATA / meta["id"] / "game.py")
+    if path:
+        results, games_hit = sandbox.run("audit", timeout=600, path=path, checker_dir=str(cdir),
+                                         n_games=n_games, specs_by_seed=SPECS_BY_SEED)
+    else:
+        results, games_hit = _audit_inprocess(game, cdir, n_games)
     meta["checkers"] = [{"name": n, "rule": r["rule"], "gaps": r["gaps"][:3],
                          "findings": r["findings"][:8], "n_findings": len(r["findings"]),
-                         "games_hit": len(games_hit[n]), "games_total": n_games}
+                         "games_hit": games_hit[n], "games_total": n_games}
                         for n, r in results.items()]
     meta["checkers_games"] = n_games
     # plain-language questions for every auditor that found something
@@ -761,9 +792,10 @@ def resolve_finding(pid: str, req: Resolution):
             new_code = llm.repair_engine(rulebook, code, error)
             _write_engine(pid, new_code, f"fixed: {req.name}")
             j["detail"] = "re-validating"
+            _err = _validate_file(pid, players=(2,))
+            if _err:
+                raise RuntimeError("the fixed engine fails validation:\n" + _err)
             game = _engine_for(meta)
-            for seed in range(12):
-                play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
             j["detail"] = "re-auditing"
             m2 = _load(pid)
             run_checkers(m2, game, cdir)
@@ -848,9 +880,10 @@ def _repair_and_reaudit(pid: str, meta: dict, j: dict, reason: str, findings: li
     new_code = llm.repair_engine(rulebook, code, error)
     _write_engine(pid, new_code, f"fixed: {label}")
     j["detail"] = "re-validating"
+    _err = _validate_file(pid, players=(2,))
+    if _err:
+        raise RuntimeError("the fixed engine fails validation:\n" + _err)
     game = _engine_for(meta)
-    for seed in range(12):
-        play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
     j["detail"] = "re-auditing"
     m2 = _load(pid)
     run_checkers(m2, game, DATA / pid / "checkers")
@@ -922,9 +955,10 @@ def run_jury(pid: str, j: dict) -> None:
         new_code = llm.repair_engine(rulebook, code, reason)
         _write_engine(pid, new_code, "fixed: " + ", ".join(c["name"] for c, _ in to_fix))
         j["detail"] = "re-validating"
+        _err = _validate_file(pid, players=(2,))
+        if _err:
+            raise RuntimeError("the fixed engine fails validation:\n" + _err)
         game = _engine_for(_load(pid))
-        for seed in range(12):
-            play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
         j["detail"] = "re-auditing once"
         m2 = _load(pid)
         run_checkers(m2, game, DATA / pid / "checkers")
@@ -1065,9 +1099,10 @@ def fix_from_findings(pid: str):
         code = llm.repair_engine(rulebook, code, error)
         _write_engine(pid, code, "fixed from auditor findings")
         j["detail"] = "re-validating"
+        _err = _validate_file(pid, players=(2,))
+        if _err:
+            raise RuntimeError("the fixed engine fails validation:\n" + _err)
         game = _engine_for(meta)
-        for seed in range(12):
-            play_game(game, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
         j["detail"] = "re-auditing"
         run_checkers(meta, game, DATA / pid / "checkers")
         meta["fix_rounds"] = meta.get("fix_rounds", 0) + 1
@@ -1099,16 +1134,7 @@ def generate(pid: str, force: bool = False):
         """Write, load, play random games with invariants on. Returns None if
         clean, else the traceback text to hand back to the model."""
         _write_engine(pid, code, "validating")
-        try:
-            game = _engine_for(meta)
-            for n in (2, 3, 4):
-                for seed in range(12):
-                    _check_cancel()
-                    agents = [make_agent("random", seed * 10 + i) for i in range(n)]
-                    play_game(game, agents, seed, debug=True)
-        except Exception:
-            return traceback.format_exc()
-        return None
+        return _validate_file(pid)
 
     def work(j):
         rulebook = rb.read_text(encoding="utf-8")
@@ -1136,7 +1162,8 @@ def generate(pid: str, force: bool = False):
             raise RuntimeError(f"engine still failing after {rounds} repair rounds; "
                                f"last error: {err.strip().splitlines()[-1]}")
         j["detail"] = "engine quality checks: seat symmetry, termination, determinism"
-        meta["quality"] = quality_report(_engine_for(meta))
+        meta["quality"] = (quality_report(_engine_for(meta)) if meta.get("builtin") else
+                           sandbox.run("quality", timeout=900, path=str(DATA / pid / "game.py")))
         m = _load(pid)  # _write_engine updated versions; merge into the saved copy
         m["engine"] = "generated"
         m["current_label"] = f"generated ({rounds} repair rounds)" if rounds else "generated (first try)"
@@ -1174,20 +1201,11 @@ def run_sim(pid: str, req: SimRequest):
             records, secs = simulate(game_name, specs, req.games, seed=0,
                                      workers=2, rotate=req.rotate)
             game = make_game(game_name)
-        else:  # generated engines: run in-process (no worker pool yet)
+        else:  # generated engines: run in a killable child process
             game = _engine_for(meta)
-            records = []
             t0 = time.time()
-            for seed in range(req.games):
-                order = list(range(len(specs)))
-                if req.rotate:
-                    k = seed % len(specs)
-                    order = order[k:] + order[:k]
-                agents = [make_agent(specs[j], seed * 100 + i)
-                          for i, j in enumerate(order)]
-                rec = play_game(game, agents, seed)
-                rec.extra["seat_agent"] = [specs[j] for j in order]
-                records.append(rec)
+            records = sandbox.run("play", timeout=900, path=str(DATA / pid / "game.py"), specs=specs,
+                                  n_games=req.games, rotate=req.rotate)
             secs = time.time() - t0
         j["detail"] = "writing the report"
         md = make_report(records, game)
@@ -1243,9 +1261,9 @@ def run_second_opinion(pid: str):
         while True:
             (DATA / pid / "game2.py").write_text(code, encoding="utf-8")
             try:
-                g2 = _engine_for(meta, "game2.py")
-                for seed in range(12):
-                    play_game(g2, [make_agent("random", seed * 10 + i) for i in range(2)], seed, debug=True)
+                _err = _validate_file(pid, "game2.py", players=(2,))
+                if _err:
+                    raise RuntimeError(_err)
                 break
             except Exception:
                 if rounds >= 3:
@@ -1254,7 +1272,8 @@ def run_second_opinion(pid: str):
                 j["detail"] = f"second engine failed validation — repair round {rounds}"
                 code = llm.repair_engine(rulebook, code, traceback.format_exc())
         j["detail"] = "comparing the two engines on random play"
-        meta["second_opinion"] = second_opinion(_engine_for(meta), _engine_for(meta, "game2.py"))
+        meta["second_opinion"] = sandbox.run("second", timeout=900, path_a=str(DATA / pid / "game.py"),
+                                             path_b=str(DATA / pid / "game2.py"))
         meta["second_opinion_cost"] = llm.cost_note()
         _save(meta)
 

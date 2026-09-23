@@ -507,12 +507,23 @@ as STATED, and must not be raised again as an assumption, question, or gap.
 {rulebook}
 """
 
-TRIAGE_PROMPT = """Below is a rulebook and a list of questions a reviewer raised \
-about it. For each question, decide whether the rulebook text actually \
-answers it. If it does, give the answer and quote the passage. If it does \
-not, say so. Do not guess, do not use knowledge of other games. Return ONLY a \
-JSON array in the same order: [{{"answered": true|false, "answer": "<the \
-answer from the text, or empty>", "quote": "<the passage, or empty>"}}]
+TRIAGE_PROMPT = """Below is a rulebook and a list of items a reviewer raised about it. \
+You are the gatekeeper: only genuine rules questions may reach the game's \
+designer. Classify each item as exactly one of:
+- "answered": the rulebook text (including any "Clarifications from the \
+designer" section, which is authoritative) already settles it — give the \
+answer and quote the passage;
+- "gap": a real rule the text does not settle (a case that can arise in play \
+and has no rule for it, or two passages that conflict);
+- "example": not a rule at all — the reviewer chose a colour, a card, a \
+player or an example cost to illustrate something;
+- "design": a question about intent or balance ("is it acceptable that…", \
+"is it guaranteed that…", "why…") rather than about what the rule is;
+- "duplicate": the same question as an earlier item in this list.
+Do not guess, do not use knowledge of other games. Return ONLY a JSON array \
+in the same order: [{{"kind": "answered|gap|example|design|duplicate", \
+"answer": "<the answer from the text, or empty>", "quote": "<the passage, or \
+empty>"}}]
 
 === rulebook ===
 {rulebook}
@@ -570,8 +581,11 @@ def triage_questions(rulebook: str, questions: list[str]) -> list[dict]:
     out = []
     for i in range(len(questions)):
         it = items[i] if i < len(items) and isinstance(items[i], dict) else {}
-        out.append({"answered": bool(it.get("answered")), "answer": str(it.get("answer", ""))[:500],
-                    "quote": str(it.get("quote", ""))[:300]})
+        kind = str(it.get("kind", "")).lower()
+        if kind not in ("answered", "gap", "example", "design", "duplicate"):
+            kind = "answered" if it.get("answered") else "gap"
+        out.append({"kind": kind, "answered": kind == "answered",
+                    "answer": str(it.get("answer", ""))[:500], "quote": str(it.get("quote", ""))[:300]})
     return out
 
 
