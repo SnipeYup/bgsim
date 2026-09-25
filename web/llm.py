@@ -46,6 +46,8 @@ class Cancelled(RuntimeError):
 
 
 cancel_check = None  # app sets: callable() -> bool, True when the current job was stopped
+progress = None      # app sets: callable(str) to show what the model is doing mid-call
+on_cap = None        # app sets: callable(spent, cap) -> new cap to continue with, or None to stop
 
 
 def _maybe_cancel():
@@ -54,11 +56,13 @@ def _maybe_cancel():
 
 
 def configure(tier: str = "light", pid: str | None = None, cap_usd: float | None = None,
-              spent_usd: float = 0.0) -> None:
+              spent_usd: float = 0.0, job_cap_usd: float | None = None) -> None:
     _ctx.tier = tier if tier in ROUTES else "light"
     _ctx.pid = pid
     _ctx.cap = cap_usd
     _ctx.spent = spent_usd
+    _ctx.job_cap = job_cap_usd
+    _ctx.job_spent = 0.0
 
 
 def model_for(role: str, escalate: bool = False) -> str:
@@ -86,6 +90,15 @@ def _spend_check(model: str) -> None:
     if cap is not None and getattr(_ctx, "spent", 0.0) >= cap:
         raise BudgetExceeded(f"this project has used ${_ctx.spent:.2f} of its ${cap:.2f} model "
                              f"budget; nothing more will run until the budget is raised")
+    jcap = getattr(_ctx, "job_cap", None)
+    if jcap is not None and getattr(_ctx, "job_spent", 0.0) >= jcap:
+        if on_cap is not None:
+            new_cap = on_cap(_ctx.job_spent, jcap)   # blocks until the designer decides
+            if new_cap is None:
+                raise Cancelled("stopped at the spending cap")
+            _ctx.job_cap = new_cap
+            return
+        raise BudgetExceeded(f"this run has cost ${_ctx.job_spent:.2f}, over its ${jcap:.2f} cap")
 
 
 def _spend_record(model: str) -> float:
@@ -93,6 +106,7 @@ def _spend_record(model: str) -> float:
     ri, ro = RATES.get(model, (2.0, 10.0))
     usd = i / 1e6 * ri + o / 1e6 * ro
     _ctx.spent = getattr(_ctx, "spent", 0.0) + usd
+    _ctx.job_spent = getattr(_ctx, "job_spent", 0.0) + usd
     if on_cost and getattr(_ctx, "pid", None):
         try:
             on_cost(_ctx.pid, model, usd, {"in": i, "out": o,
@@ -132,12 +146,14 @@ complete Python file, no fences, no commentary.
 """
 
 
-RETRYABLE = (ConnectionError, ConnectionResetError, TimeoutError, OSError)
+RETRYABLE = (ConnectionError, ConnectionResetError, TimeoutError, OSError, urllib.error.URLError)
 
 
-def _call_streaming(key: str, body: dict, attempts: int = 3) -> str:
+def _call_streaming(key: str, body: dict, attempts: int = 6) -> str:
     """Front door for every model call: retries a stalled or dropped
-    connection (the network, not the model), never a real API error."""
+    connection (the network, not the model), never a real API error.
+    Waits 5, 10, 20, 40, 60 seconds between tries — a couple of minutes of
+    outage should not sink a run someone walked away from."""
     last = None
     for attempt in range(attempts):
         try:
@@ -146,7 +162,10 @@ def _call_streaming(key: str, body: dict, attempts: int = 3) -> str:
             raise
         except RETRYABLE as e:
             last = e
-            time.sleep(3 * (attempt + 1))
+            if attempt == attempts - 1:
+                break
+            _maybe_cancel()
+            time.sleep(min(60, 5 * 2 ** attempt))
     raise RuntimeError(f"the connection to the model kept failing ({type(last).__name__}: {last}); "
                        "nothing was changed — try again") from None
 
@@ -154,6 +173,7 @@ def _call_streaming(key: str, body: dict, attempts: int = 3) -> str:
 def _call_streaming_once(key: str, body: dict) -> str:
     """Stream the response so the connection never looks idle; assemble the
     text deltas. Returns the full text."""
+    _chars, _shown, _thinking_shown = 0, 0, False
     body = dict(body, stream=True)
     _maybe_cancel()
     if not _supports_effort(body.get("model", MODEL)):
@@ -186,6 +206,19 @@ def _call_streaming_once(key: str, body: dict) -> str:
                 d = evt.get("delta", {})
                 if d.get("type") == "text_delta":
                     out.append(d.get("text", ""))
+                    _chars += len(d.get("text", ""))
+                    if progress and _chars - _shown > 2000:
+                        _shown = _chars
+                        try:
+                            progress(f"model writing… ~{_chars // 4:,} tokens so far")
+                        except Exception:
+                            pass
+                elif d.get("type") == "thinking_delta" and progress and not _thinking_shown:
+                    _thinking_shown = True
+                    try:
+                        progress("model thinking…")
+                    except Exception:
+                        pass
             elif t == "message_start":
                 u = evt.get("message", {}).get("usage", {})
                 LAST_USAGE.clear(); LAST_USAGE.update(input=u.get("input_tokens", 0), output=0,
@@ -217,6 +250,14 @@ class TruncatedOutput(RuntimeError):
                          f"{lines} lines; partial output saved as partial.py")
 
 
+PASS_NOTE = """
+=== passing ===
+Offer a pass / do-nothing action ONLY when the rulebook explicitly allows \
+voluntary passing, or when the player has no other legal action. Never list \
+it beside real actions by default: automated players will choose it, and an \
+"everyone passed -> game ends" rule then ends games at once.
+"""
+
 COMPONENT_NOTE = """
 === component data ===
 The rulebook is followed by a section "Component data" with tables the designer \
@@ -239,7 +280,7 @@ def generate_engine(rulebook: str) -> str:
         "max_tokens": 64000,
         "output_config": {"effort": effort_for("engine")},
         "messages": [{"role": "user", "content": PROMPT.format(
-            spec=ENGINE_SPEC, rulebook=rulebook[:120_000])}],
+            spec=ENGINE_SPEC + PASS_NOTE + COMPONENT_NOTE, rulebook=rulebook[:120_000])}],
     }
     code = _call_streaming(key, body).strip()   # retries live inside
     if code.startswith("```"):
@@ -279,7 +320,7 @@ def repair_engine(rulebook: str, code: str, error: str, escalate: bool = False) 
     body = {"model": model_for("engine", escalate=escalate), "max_tokens": 64000,
             "output_config": {"effort": effort_for("engine")},
             "messages": [{"role": "user", "content": REPAIR_PROMPT.format(
-                spec=ENGINE_SPEC, rulebook=rulebook[:120_000], code=code,
+                spec=ENGINE_SPEC + PASS_NOTE + COMPONENT_NOTE, rulebook=rulebook[:120_000], code=code,
                 error=error[-4000:])}]}
     fixed = _clean(_call_streaming(key, body))
     if "def initial_state" not in fixed:
@@ -404,6 +445,10 @@ information the rule needs, return one message starting with "SCHEMA GAP:" \
 instead of guessing. Be strict on what the section states, silent on what it \
 doesn't.
 
+Action encodings: the schema includes one worked example per action kind \
+with exactly what changed in the state. Take the meaning of every position in \
+an action from those examples — never assume that a number is a deck index, a \
+slot, or a colour without checking it against the recorded change.
 Timing matters: a rule stated for a moment ("at the end of your turn", "at \
 harvest", "when the game ends") must be checked only at that moment — for an \
 end-of-turn limit, only at transitions where the acting player changes, never \
@@ -457,7 +502,11 @@ EXPLAIN_PROMPT = """You explain a disagreement about a board game's rules to the
 game's designer, who does not program. For each auditor below you get: the \
 rule it checks, its raw findings (technical — never quote them), and a \
 plain-language replay of the moment in the game it flagged, in the game's own \
-words. From the replay, say what the simulated players did in 1-2 sentences a \
+words. An auditor can be wrong about WHAT HAPPENED, not only about the rule — \
+e.g. by misreading which deck or slot an action refers to. When the replay \
+or the recorded state change contradicts the auditor's account, say so \
+plainly in "simulation_did" and make the deciding question about that fact. \
+From the replay, say what the simulated players did in 1-2 sentences a \
 designer would recognise (turns, gems, food, cards — never "steps", "actions of \
 type", "engine", "state", or code names). Then find the ONE rules question \
 whose answer decides who is right, and write the two candidate answers: the \
@@ -465,12 +514,18 @@ answer under which the simulation behaved correctly, and the answer under \
 which the auditor is correct. Each candidate must be a complete statement of \
 the rule a designer could adopt as written. Do not decide who is right.
 
+If the record shows the auditor misdescribed what happened — so that both \
+candidate answers would be the same rule and there is nothing for the \
+designer to decide — set "record_contradicts_auditor" to true and explain \
+the misreading in "simulation_did".
+
 Return ONLY a JSON array: [{{"name": "<auditor name exactly as given>", \
 "simulation_did": "<1-2 sentences from the replay>", \
 "rule": "<the rulebook phrase this concerns>", \
 "question": "<the deciding question>", \
 "answer_if_simulation_right": "<complete rule statement>", \
-"answer_if_auditor_right": "<complete rule statement>"}}]
+"answer_if_auditor_right": "<complete rule statement>", \
+"record_contradicts_auditor": false}}]
 
 === rulebook ===
 {rulebook}
@@ -478,6 +533,31 @@ Return ONLY a JSON array: [{{"name": "<auditor name exactly as given>", \
 === auditors ===
 {findings}
 """
+
+
+VERIFY_CLAIM_PROMPT = """An automated auditor claims a board game simulation broke a rule at \
+a recorded step. Below is the auditor's claim, and the RECORD of that step: \
+the action, the engine's own description of it, and exactly which parts of \
+the game state changed. Decide only this: does the record CONTRADICT the \
+auditor's account of what happened? (For example: the auditor says deck 1 \
+was not drawn from, but the record shows deck 2 was drawn from and the \
+action referred to deck 2.) Do not judge the rule itself.
+
+Return ONLY a JSON object: {{"contradicted": true|false, "why": "<one sentence>"}}
+
+=== claim ===
+{claim}
+
+=== record of that step ===
+{record}
+"""
+
+
+def verify_claim(claim: str, record: str) -> dict:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    d = _json_obj_call(key, VERIFY_CLAIM_PROMPT.format(claim=claim[:1500], record=record[:4000]),
+                       max_tokens=600)
+    return {"contradicted": bool(d.get("contradicted")), "why": str(d.get("why", ""))[:300]}
 
 
 def explain_findings(rulebook: str, findings: dict[str, list[str]],
@@ -498,6 +578,7 @@ def explain_findings(rulebook: str, findings: dict[str, list[str]],
             out[it["name"]] = {k: str(it.get(k, ""))[:800]
                                for k in ("simulation_did", "rule", "question",
                                          "answer_if_simulation_right", "answer_if_auditor_right")}
+            out[it["name"]]["record_contradicts_auditor"] = bool(it.get("record_contradicts_auditor"))
     return out
 
 
@@ -655,7 +736,12 @@ State turn-order facts (who is the starting player, who acts last) as facts \
 taken from the replay, and keep the scenario internally consistent.
 
 The "moment in the game record" below is what the simulation was actually \
-doing at the flagged step — its phase and pending action. If it shows the \
+doing at the flagged step — its phase, its action, and exactly which parts of \
+the state changed. Check the auditor's account against it: auditors can \
+misread an action encoding and report a violation that the record shows did \
+not happen (e.g. "deck 1 was not drawn from" when the record shows deck 2 \
+was, and deck 2 was the right one). If the record contradicts the auditor, \
+the scenario must say so and "auditor_value" must note the misreading. If it shows the \
 moment was mid-turn (e.g. a discard or payment still pending), the scenario \
 must say so; the auditor may have judged the wrong moment.
 

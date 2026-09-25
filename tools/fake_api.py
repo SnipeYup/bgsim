@@ -76,6 +76,13 @@ class H(BaseHTTPRequestHandler):
                 {"text": "Player 1 takes 3 wood from the Forest.", "assumption": ""},
                 {"text": "Player 2 plows a field next to their house.", "rule_gap": "whether the first field must be adjacent to the house"},
                 {"text": "Player 1 takes white, blue and green gems.", "rule_gap": ""}]}))
+        if "does the record CONTRADICT the" in text:
+            claim = text.split("=== claim ===")[1].split("=== record")[0]
+            record = text.split("=== record of that step ===")[1]
+            import re as _re
+            mnum = _re.search(r"deck (\d)", claim)
+            bad = bool(mnum) and f"decks[{mnum.group(1)}]" not in record and "decks[" in record
+            return self._stream_text(json.dumps({"contradicted": bad, "why": "the record shows deck 2 changed, which the action referred to" if bad else "record matches the claim"}))
         if "You are the gatekeeper" in text:
             n = text.split("=== questions ===")[1].count("\n")
             qs = [q for q in text.split("=== questions ===")[1].strip().split("\n") if q.strip()]

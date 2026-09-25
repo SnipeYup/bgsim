@@ -42,11 +42,23 @@ def record_trace(game, agent_specs, n_players: int, seed: int,
         p = game.current_player(state)
         action = agents[p].act(game, state, p)
         nxt = game.apply(state, action)
-        steps.append({
+        rec = {
             "i": i, "phase": game.phase(state), "player": p,
             "action": _plain(action), "before": _plain(state),
             "after": _plain(nxt),
-        })
+        }
+        da = getattr(game, "describe_action", None)
+        if da:
+            try:
+                rec["describe"] = str(da(state, action))[:200]
+            except TypeError:
+                try:
+                    rec["describe"] = str(da(action))[:200]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        steps.append(rec)
         state = nxt
     return {
         "meta": {"game": game.name, "n_players": n_players, "seed": seed,
@@ -88,11 +100,58 @@ def print_schema(trace: dict) -> str:
            "meta: " + json.dumps(trace["meta"]),
            "scores: " + json.dumps(trace["scores"]),
            "summary: " + json.dumps(_schema(trace["summary"]), indent=1), "",
-           "SAMPLE STEPS (action + state deltas are what checkers audit)", ""]
-    for s in trace["steps"][:2] + trace["steps"][-2:]:
-        out.append(json.dumps({"i": s["i"], "phase": s["phase"],
-                               "player": s["player"], "action": s["action"]}))
+           "ACTION ENCODINGS — one worked example per kind, with exactly what changed.",
+           "Read the encoding from these examples, never guess the meaning of a position", ""]
+    def _nums(x):
+        if isinstance(x, bool):
+            return []
+        if isinstance(x, (int, float)):
+            return [x]
+        if isinstance(x, (list, tuple)):
+            return [n for y in x for n in _nums(y)]
+        return []
+    # one example per action kind; prefer an example whose numbers are all
+    # different, so a reader cannot confuse which position means what
+    best = {}
+    for st in trace["steps"]:
+        kind = st["action"][0] if isinstance(st["action"], (list, tuple)) and st["action"] else str(st["action"])
+        nums = _nums(st["action"])
+        distinct = len(nums) == len(set(nums))
+        if kind not in best or (distinct and not best[kind][0]):
+            best[kind] = (distinct, st)
+    for kind, (_, st) in best.items():
+        out.append(json.dumps({"i": st["i"], "phase": st["phase"], "player": st["player"], "action": st["action"]}))
+        if st.get("describe"):
+            out.append("   engine says: " + st["describe"])
+        out.append("   changed: " + state_diff(st["before"], st["after"]))
+        out.append("")
     return "\n".join(out)
+
+
+def state_diff(before, after, path="", limit=40) -> str:
+    """Compact list of what differs between two states, with lengths for
+    lists — enough to see 'decks[2]: 16 -> 15' without dumping the state."""
+    diffs = []
+
+    def walk(a, b, p):
+        if len(diffs) >= limit:
+            return
+        if isinstance(a, dict) and isinstance(b, dict):
+            for k in sorted(set(a) | set(b)):
+                walk(a.get(k), b.get(k), f"{p}.{k}" if p else str(k))
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                diffs.append(f"{p}: {len(a)} items -> {len(b)} items")
+            elif a != b and all(isinstance(x, (int, float)) for x in a + b):
+                diffs.append(f"{p}: {a} -> {b}")
+            else:
+                for idx, (x, y) in enumerate(zip(a, b)):
+                    if x != y:
+                        walk(x, y, f"{p}[{idx}]")
+        elif a != b:
+            diffs.append(f"{p}: {a!r} -> {b!r}")
+    walk(before, after, path)
+    return "; ".join(diffs) if diffs else "(nothing)"
 
 
 def main(argv=None):

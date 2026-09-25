@@ -23,6 +23,11 @@ Action = Hashable
 State = Any
 
 
+# Passing: a "pass"/"do nothing" action is legal ONLY when the rules explicitly
+# allow voluntary passing, or when a player has no other legal action. Never
+# offer it alongside real actions by default — greedy players will take it, and
+# an "everyone passed -> game ends" rule will then end games instantly.
+
 class Game(Protocol):
     name: str
 

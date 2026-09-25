@@ -65,8 +65,14 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
         purchased = r.extra.get("purchased")
         if not purchased:
             continue
+        if not isinstance(purchased, (list, tuple)):
+            continue
         for seat, cards in enumerate(purchased):
+            if not isinstance(cards, (list, tuple)):   # a count, not a list of ids: nothing per-card to say
+                continue
             for c in cards:
+                if isinstance(c, (list, dict)):
+                    continue
                 bought[c] += 1
                 if seat in r.winners:
                     bought_by_winner[c] += 1
@@ -115,16 +121,22 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
     games_with_noble = 0
     for r in records:
         nb = r.extra.get("nobles")
-        if nb is None:
+        if not isinstance(nb, (list, tuple)):
             continue
         if any(nb):
             games_with_noble += 1
         for seat, ids in enumerate(nb):
+            if isinstance(ids, (int, float)):        # a count per player: still counts as "a noble visited"
+                continue
+            if not isinstance(ids, (list, tuple)):
+                continue
             for nid in ids:
+                if isinstance(nid, (list, dict)):
+                    continue
                 nobles[nid] += 1
                 if seat in r.winners:
                     nobles_winner[nid] += 1
-    if nobles or games_with_noble:
+    if nobles:
         lines += ["## Nobles",
                   f"- games with at least one noble claimed: {_pct(games_with_noble / n)}",
                   f"- nobles claimed per game: {sum(nobles.values()) / n:.2f}",

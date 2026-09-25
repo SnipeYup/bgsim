@@ -105,6 +105,14 @@ def _validate_file(pid: str, filename: str = "game.py", players=(2, 3, 4), seeds
         return str(e)
 
 
+def _mark_stale(meta: dict) -> None:
+    """After the engine changes, earlier checks describe a different engine."""
+    for k in ("quality", "second_opinion"):
+        if meta.get(k):
+            meta[f"{k}_stale"] = True
+    meta["needs_regeneration"] = False
+
+
 def _write_engine(pid: str, code: str, label: str) -> None:
     """Write game.py, archiving the previous version so any change is reversible."""
     d = DATA / pid
@@ -121,6 +129,7 @@ def _write_engine(pid: str, code: str, label: str) -> None:
     cur.write_text(code, encoding="utf-8")
     meta["versions"] = versions
     meta["current_label"] = label
+    _mark_stale(meta)
     _save(meta)
 
 
@@ -163,11 +172,80 @@ def _check_cancel() -> None:
 llm.cancel_check = lambda: bool(getattr(_current, "job", None) and _current.job.get("cancel"))
 
 
+def _progress(msg: str) -> None:
+    j = getattr(_current, "job", None)
+    if j is not None:
+        dict.__setitem__(j, "progress", msg)   # not via detail: keep the stage label
+
+
+llm.progress = _progress
+
+
+def _on_cap(spent: float, cap: float):
+    """Hold the job at a call boundary until the designer continues or stops.
+    Work already done stays; nothing is re-run."""
+    j = getattr(_current, "job", None)
+    if j is None:
+        return None
+    dict.__setitem__(j, "paused", {"spent": round(spent, 2), "cap": round(cap, 2),
+                                   "offer": round(cap + max(cap, 0.5), 2)})
+    t0 = time.time()
+    while time.time() - t0 < 6 * 3600:          # wait up to six hours for an answer
+        if j.get("cancel"):
+            dict.__setitem__(j, "paused", None)
+            return None
+        raised = j.get("cap_raised")
+        if raised:
+            dict.__setitem__(j, "paused", None); dict.__setitem__(j, "cap_raised", None)
+            dict.__setitem__(j, "cap_usd", raised)
+            return raised
+        time.sleep(1)
+    dict.__setitem__(j, "paused", None)
+    return None
+
+
+llm.on_cap = _on_cap
+
+
+def learned_estimate(kind: str, tier: str) -> float:
+    """Median cost of the last few finished runs of this kind (any project),
+    once there are three; the table otherwise."""
+    costs = []
+    for rec in SPEND.values():
+        by_job = {}
+        for e in rec.get("ledger", []):
+            k = e["stage"].split(":")[0]
+            if k == kind:
+                by_job.setdefault(int(e["time"] // 1800), 0.0)   # half-hour buckets ≈ one run
+                by_job[int(e["time"] // 1800)] += e["usd"]
+        costs += list(by_job.values())
+    costs = sorted(costs)[-9:]
+    if len(costs) >= 3:
+        return round(1.15 * costs[len(costs) // 2], 2)
+    return estimate_for(kind, tier)
+
+
+# Rough per-run estimates in USD by kind and tier; the cap is 3x the estimate.
+ESTIMATES = {
+    "light": {"workshop": 0.15, "generate": 0.35, "checkers": 0.45, "jury": 0.60, "fix": 0.60,
+              "resolve_answer": 0.60, "second_opinion": 0.50, "run_all": 1.60, "review": 0.15,
+              "simulate": 0.0, "quality": 0.0},
+    "heavy": {"workshop": 0.30, "generate": 1.50, "checkers": 0.90, "jury": 1.20, "fix": 1.50,
+              "resolve_answer": 1.50, "second_opinion": 1.80, "run_all": 5.00, "review": 0.30,
+              "simulate": 0.0, "quality": 0.0},
+}
+
+
+def estimate_for(kind: str, tier: str) -> float:
+    return ESTIMATES.get(tier, ESTIMATES["light"]).get(kind, 0.50)
+
+
 class _StagedJob(dict):
     """Job dict whose 'detail' updates also label model calls for the ledger."""
     def __setitem__(self, k, v):
         super().__setitem__(k, v)
         if k == "detail":
+            super().__setitem__("progress", "")
             llm.set_stage(f"{self.get('kind', '?')}: {v}")
 
 
@@ -177,7 +255,17 @@ def _run_in_thread(job: dict, fn) -> None:
         try:
             m = _load(job["project"]) if job.get("project") else {}
             cx = m.get("complexity") or {"tier": "light", "budget_usd": BUDGET_USD["light"]}
-            llm.configure(cx["tier"], job.get("project"), cx["budget_usd"], m.get("spend_usd", 0.0))
+            est = learned_estimate(job.get("kind", ""), cx["tier"])
+            job["estimate_usd"] = est
+            job["cap_usd"] = round(3 * est, 2) if est > 0 else None
+            if job.get("parent"):     # a sub-step spends against its parent's cap
+                parent = JOBS.get(job["parent"])
+                job["cap_usd"] = parent.get("cap_usd") if parent else None
+                job["spent_usd"] = parent.get("spent_usd", 0.0) if parent else 0.0
+            llm.configure(cx["tier"], job.get("project"), cx["budget_usd"], m.get("spend_usd", 0.0),
+                          job_cap_usd=job["cap_usd"])
+            if job.get("parent"):
+                llm._ctx.job_spent = job.get("spent_usd", 0.0)
             llm.set_stage(f"{job.get('kind', '?')}")
             fn(job)
             job["status"] = "done"
@@ -223,6 +311,12 @@ SPEND: dict[str, dict] = {}  # pid -> {"usd": float, "by_model": {...}}; merged 
 
 
 def _record_cost(pid: str, model: str, usd: float, info: dict | None = None) -> None:
+    j = getattr(_current, "job", None)
+    if j is not None:
+        dict.__setitem__(j, "spent_usd", round(j.get("spent_usd", 0.0) + usd, 4))
+        parent = JOBS.get(j.get("parent") or "")
+        if parent is not None:
+            dict.__setitem__(parent, "spent_usd", round(parent.get("spent_usd", 0.0) + usd, 4))
     rec = SPEND.setdefault(pid, {"usd": 0.0, "by_model": {}, "ledger": []})
     rec["usd"] = round(rec["usd"] + usd, 4)
     rec["by_model"][model] = round(rec["by_model"].get(model, 0.0) + usd, 4)
@@ -635,6 +729,37 @@ def workshop_undo(pid: str, req: WorkshopAnswer):
     return meta
 
 
+class Clarify(BaseModel):
+    text: str
+
+
+@app.post("/api/projects/{pid}/workshop/clarify")
+def workshop_clarify(pid: str, req: Clarify):
+    """A rule the designer adds on their own initiative (e.g. from a report finding)."""
+    meta = _load(pid)
+    text = req.text.strip()
+    if len(text) < 8:
+        raise HTTPException(400, "write the rule out")
+    key = f"designer:{int(time.time())}"
+    _set_clarification(pid, meta, key, "Designer-added rule", text)
+    if meta.get("engine") == "generated":
+        meta["needs_regeneration"] = True
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/workshop/unclarify")
+def workshop_unclarify(pid: str, req: WorkshopAnswer):
+    meta = _load(pid)
+    if not any(r["key"] == req.item_id for r in meta.get("clarifications_store", [])):
+        raise HTTPException(404, "no such rule")
+    _drop_clarification(pid, meta, req.item_id)
+    if meta.get("engine") == "generated":
+        meta["needs_regeneration"] = True
+    _save(meta)
+    return meta
+
+
 @app.post("/api/projects/{pid}/workshop/dismiss")
 def workshop_dismiss(pid: str, req: WorkshopAnswer):
     """'Not a rules question' — settles the item without a clarification."""
@@ -707,8 +832,9 @@ def clarify(pid: str, req: Answers):
 
 
 @app.post("/api/projects/{pid}/checkers")
-def build_checkers(pid: str):
-    """Stage 3: compile the rulebook into independent checkers and run them."""
+def build_checkers(pid: str, force: bool = False):
+    """Stage 3: compile the rulebook into independent checkers and run them.
+    force=True replaces an existing set (old files archived, rulings kept)."""
     meta = _load(pid)
     game = _engine_for(meta)
     rb = DATA / pid / "rulebook.txt"
@@ -720,6 +846,14 @@ def build_checkers(pid: str):
         rulebook = _rulebook_for_model(pid)
         cdir = DATA / pid / "checkers"
         cdir.mkdir(exist_ok=True)
+        if force:
+            old = DATA / pid / f"checkers_old_{int(time.time())}"
+            old.mkdir(exist_ok=True)
+            for f in list(cdir.glob("*.py")):
+                f.rename(old / f.name)
+            m0 = _load(pid)
+            m0["retired_auditors"] = []; m0["checkers"] = []; m0["checker_questions"] = {}
+            _save(m0)
         j["detail"] = "recording a sample game for the trace format"
         schema = (print_schema(record_trace(game, ["random", "random"], 2, 0)) if meta.get("builtin")
                   else sandbox.run("schema", timeout=120, path=str(DATA / pid / "game.py")))
@@ -764,12 +898,52 @@ def _narrate_moment(game, finding: str, before: int = 4, after: int = 2) -> str:
             action = agents[p].act(game, state, p)
             if i >= step - before:
                 mark = "  <-- the flagged moment" if i == step else ""
-                lines.append(f"{ds(state)}\n   Player {p + 1}: {da(state, action)}{mark}")
+                lines.append(f"{ds(state)}\n   Player {p + 1}: {sandbox._desc(da, state, action)}{mark}")
             state = game.apply(state, action)
             i += 1
         return "\n".join(lines)
     except Exception as e:
         return f"(could not replay the moment: {e})"
+
+
+def _step_record(game, finding: str) -> str:
+    """Action + engine description + state diff at the step a finding names."""
+    import re
+    from bgsim.trace import state_diff
+    g = re.search(r"game (\d+)", finding); st = re.search(r"step (\d+)", finding)
+    if not g or not st:
+        return ""
+    seed = int(g.group(1)); step = int(st.group(1))
+    specs = SPECS_BY_SEED[seed % len(SPECS_BY_SEED)]
+    try:
+        tr = record_trace(game, specs, len(specs), 500 + seed)
+        s = tr["steps"][step]
+        return (f"action: {s['action']}\nengine says: {s.get('describe', '?')}\n"
+                f"state changes: {state_diff(s['before'], s['after'])}")
+    except Exception as e:
+        return f"(could not replay: {e})"
+
+
+def _verify_auditor_claims(meta: dict, game) -> None:
+    """Before findings reach the designer or the jury: check a sample of each
+    auditor's claims against the record. An auditor whose claims the record
+    contradicts is marked suspect, not presented as a finding."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    for c in meta.get("checkers") or []:
+        if not c["findings"]:
+            continue
+        verdicts = []
+        for f in c["findings"][:3]:
+            rec = _step_record(game, f)
+            if not rec or rec.startswith("("):
+                continue
+            try:
+                verdicts.append(llm.verify_claim(f, rec))
+            except Exception:
+                continue
+        if verdicts and all(v["contradicted"] for v in verdicts):
+            c["suspect"] = verdicts[0]["why"]
 
 
 def _moment_context(game, finding: str) -> str:
@@ -786,8 +960,11 @@ def _moment_context(game, finding: str) -> str:
         tr = record_trace(game, specs, len(specs), 500 + seed)
         s = tr["steps"][step]
         nxt = tr["steps"][step + 1] if step + 1 < len(tr["steps"]) else None
+        from bgsim.trace import state_diff
         out = (f"At the flagged step the phase was '{s['phase']}', player {s['player']} was acting, "
-               f"and the action taken was {s['action']}; afterwards the phase was '{s['after'].get('phase', '?')}'.")
+               f"and the action taken was {s['action']}; afterwards the phase was '{s['after'].get('phase', '?')}'.\n"
+               f"WHAT ACTUALLY CHANGED in the state at that step (this is the record, more reliable than "
+               f"any description of it): {state_diff(s['before'], s['after'])}")
         if nxt:
             out += (f" The very next step was phase '{nxt['phase']}', player {nxt['player']}, "
                     f"action {nxt['action']}.")
@@ -827,17 +1004,27 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
     else:
         path = str(DATA / meta["id"] / "game.py")
     if path:
+        jb = getattr(_current, "job", None)
         results, games_hit = sandbox.run("audit", timeout=600, path=path, checker_dir=str(cdir),
-                                         n_games=n_games, specs_by_seed=SPECS_BY_SEED)
+                                         n_games=n_games, specs_by_seed=SPECS_BY_SEED,
+                                         on_progress=(lambda t: dict.__setitem__(jb, "progress", f"games {t}")) if jb is not None else None)
     else:
         results, games_hit = _audit_inprocess(game, cdir, n_games)
-    meta["checkers"] = [{"name": n, "rule": r["rule"], "gaps": r["gaps"][:3],
-                         "findings": r["findings"][:8], "n_findings": len(r["findings"]),
-                         "games_hit": games_hit[n], "games_total": n_games}
-                        for n, r in results.items()]
+    rulings = meta.get("rulings", {})
+    meta["checkers"] = []
+    for n, r in results.items():
+        entry = {"name": n, "rule": r["rule"], "gaps": r["gaps"][:3],
+                 "findings": r["findings"][:8], "n_findings": len(r["findings"]),
+                 "games_hit": games_hit[n], "games_total": n_games}
+        if r["findings"] and n in rulings:   # the designer already ruled: never ask again
+            entry.update({"decision": rulings[n]["decision"], "note": rulings[n].get("note", ""),
+                          "applied": True, "attempts": rulings[n].get("attempts", 0), "stuck": True})
+        meta["checkers"].append(entry)
     meta["checkers_games"] = n_games
     # plain-language questions for every auditor that found something
-    with_findings = {n: r["findings"] for n, r in results.items() if r["findings"]}
+    _verify_auditor_claims(meta, game)
+    with_findings = {n: r["findings"] for n, r in results.items()
+                     if r["findings"] and not any(c.get("suspect") for c in meta["checkers"] if c["name"] == n)}
     if with_findings and os.environ.get("ANTHROPIC_API_KEY"):
         rb = DATA / meta["id"] / "rulebook.txt"
         if rb.exists():
@@ -845,6 +1032,10 @@ def run_checkers(meta: dict, game, cdir: Path, n_games: int = 30) -> None:
                 moments = {n: _narrate_moment(game, f[0]) for n, f in with_findings.items()}
                 meta["checker_questions"] = llm.explain_findings(
                     rb.read_text(encoding="utf-8"), with_findings, moments)
+                for c in meta["checkers"]:   # the explainer's verdict counts like the record check
+                    q = meta["checker_questions"].get(c["name"], {})
+                    if isinstance(q, dict) and q.get("record_contradicts_auditor") and not c.get("suspect"):
+                        c["suspect"] = q.get("simulation_did", "the record contradicts the auditor's account")[:300]
             except Exception as e:  # explanations are a convenience, never a blocker
                 meta["checker_questions"] = {"_error": str(e)}
     else:
@@ -888,6 +1079,8 @@ def checkers_decide(pid: str, req: Resolution):
         raise HTTPException(400, "write it first")
     q = meta.get("checker_questions", {}).get(req.name, {})
     entry["decision"] = req.decision; entry["note"] = req.note.strip(); entry["applied"] = False
+    entry.pop("stuck", None)
+    meta.setdefault("rulings", {})[req.name] = {"decision": req.decision, "note": req.note.strip(), "attempts": 0}
     # the designer's statement of the rule goes into the rulebook straight away
     stmt = {"sim_right": q.get("answer_if_simulation_right", ""),
             "auditor_right": q.get("answer_if_auditor_right", ""),
@@ -902,10 +1095,54 @@ def checkers_decide(pid: str, req: Resolution):
 def checkers_undecide(pid: str, req: Resolution):
     meta = _load(pid)
     entry = next((c for c in meta.get("checkers") or [] if c["name"] == req.name), None)
-    if not entry or entry.get("applied"):
+    if not entry or (entry.get("applied") and not entry.get("stuck")):
         raise HTTPException(400, "nothing to undo")
-    entry.pop("decision", None); entry.pop("note", None); entry.pop("applied", None)
+    entry.pop("decision", None); entry.pop("note", None); entry.pop("applied", None); entry.pop("stuck", None)
+    meta.get("rulings", {}).pop(req.name, None)
     _drop_clarification(pid, meta, f"finding:{req.name}")
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/fix-invariant")
+def fix_invariant(pid: str):
+    """The engine failed its own invariant in the quality check: find a
+    failing game, hand the traceback to the repair loop (verified as usual)."""
+    meta = _load(pid)
+    if meta.get("builtin") or meta.get("engine") != "generated":
+        raise HTTPException(400, "no generated engine")
+    job = _job("fix", pid)
+
+    def work(j):
+        j["detail"] = "searching for a game where the engine's invariant fails"
+        tb = sandbox.run("find_failure", timeout=600, path=str(DATA / pid / "game.py"),
+                         on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+        if not tb:
+            j["detail"] = "no failure found in 1,200 random games"
+            m = _load(pid); m["quality_stale"] = True; _save(m)
+            return
+        m = _load(pid)
+        _repair_and_reaudit(pid, m, j, (
+            "The engine crashed on its OWN invariant check during play (so the state became one it "
+            "considers impossible). Find the action path that corrupts the state and fix it; do not "
+            "weaken the invariant.\n" + tb[-3000:]), [], "invariant failure")
+        j["detail"] = "re-checking engine quality"
+        m = _load(pid)
+        m["quality"] = sandbox.run("quality", timeout=900, path=str(DATA / pid / "game.py"))
+        m["quality_stale"] = False
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/checkers/retry")
+def checkers_retry(pid: str, req: Resolution):
+    meta = _load(pid)
+    entry = next((c for c in meta.get("checkers") or [] if c["name"] == req.name), None)
+    if not entry or not entry.get("stuck"):
+        raise HTTPException(400, "nothing to retry")
+    entry["applied"] = False; entry.pop("stuck", None)
     _save(meta)
     return meta
 
@@ -955,12 +1192,33 @@ def checkers_apply(pid: str):
             stmt = c.get("note") or m.get("checker_questions", {}).get(c["name"], {}).get("answer_if_auditor_right", "")
             reason += f"\n[{c['name']}] rule: {c['rule']}\n  designer's ruling: {stmt or 'the auditor is right'}"
             findings += c["findings"][:6]
-        _repair_and_reaudit(pid, m, j, reason, findings, ", ".join(c["name"] for c in to_fix))
-        m = _load(pid)
-        for c in to_fix:
-            m.setdefault("jury_trail", []).append({"auditor": c["name"], "time": time.time(),
-                "verdict": "you ruled against the simulation — fixed"})
-        _save(m)
+        names = [c["name"] for c in to_fix]
+        for rnd in range(2):
+            for n in names:
+                m.setdefault("rulings", {}).setdefault(n, {})["attempts"] = m["rulings"][n].get("attempts", 0) + 1
+            _save(m)
+            _repair_and_reaudit(pid, m, j, reason, findings, ", ".join(names))
+            m = _load(pid)
+            still = [c["name"] for c in m.get("checkers") or [] if c["name"] in names and c["n_findings"]]
+            for n in names:
+                if n not in still:
+                    m.setdefault("jury_trail", []).append({"auditor": n, "time": time.time(),
+                        "verdict": "you ruled against the simulation — fixed"})
+            _save(m)
+            if not still or rnd == 1:
+                for n in still:
+                    m.setdefault("jury_trail", []).append({"auditor": n, "time": time.time(),
+                        "verdict": "you ruled against the simulation, but two repairs did not clear the "
+                                   "auditor — the ruling is kept; press 'try the fix again' or look at the diff"})
+                _save(m)
+                break
+            j["detail"] = f"the fix did not clear: {', '.join(still)} — trying again"
+            names = still
+            reason = ("PREVIOUS FIX ATTEMPT DID NOT WORK: the auditor still reports the same violations "
+                      "after your change. Re-read the rule and change the code path that actually "
+                      "produces the state the auditor inspects.\n" + reason)
+            findings = [f for c in m["checkers"] if c["name"] in still for f in c["findings"][:6]]
+            _refresh = None
 
     _run_in_thread(job, work)
     return job
@@ -1099,8 +1357,15 @@ def _wait_job(jid: str, timeout: float = 3600, parent: dict | None = None) -> di
             raise RuntimeError("sub-step timed out")
         if parent is not None and JOBS[jid].get("detail"):
             parent["detail"] = f"{JOBS[jid]['kind']}: {JOBS[jid]['detail']}"
+            dict.__setitem__(parent, "progress", JOBS[jid].get("progress", ""))
         if parent is not None and parent.get("cancel"):
             JOBS[jid]["cancel"] = True
+        # a paused child surfaces on the parent; continuing the parent continues the child
+        if parent is not None:
+            dict.__setitem__(parent, "paused", JOBS[jid].get("paused"))
+            if parent.get("cap_raised"):
+                dict.__setitem__(JOBS[jid], "cap_raised", parent["cap_raised"])
+                dict.__setitem__(parent, "cap_usd", parent["cap_raised"]); dict.__setitem__(parent, "cap_raised", None)
         time.sleep(1)
     return JOBS[jid]
 
@@ -1125,10 +1390,24 @@ def _repair_and_reaudit(pid: str, meta: dict, j: dict, reason: str, findings: li
         j["detail"] = f"fixing the engine: {label}" + (" (second attempt, stronger model)" if attempt else "")
         new_code = llm.repair_engine(rulebook, code, error, escalate=bool(attempt))
         _write_engine(pid, new_code, f"fixed: {label}" + (" (2nd attempt)" if attempt else ""))
-        j["detail"] = "re-validating"
-        _err = _validate_file(pid, players=(2,))
-        if _err:
-            raise RuntimeError("the fixed engine fails validation:\n" + _err)
+        # a fix that breaks the engine is handed back to the model, not to the designer
+        for vround in range(3):
+            j["detail"] = "re-validating"
+            _err = _validate_file(pid, players=(2,))
+            if not _err:
+                break
+            if vround == 2:
+                _write_engine(pid, code, f"reverted: '{label}' fix broke validation")
+                raise RuntimeError("the fix broke the engine three times running; the engine was put back "
+                                   "as it was. Last failure:\n" + _err[-1500:])
+            j["detail"] = f"the fix broke something — repairing ({vround + 1}/3)"
+            broken = (DATA / pid / "game.py").read_text(encoding="utf-8")
+            new_code = llm.repair_engine(rulebook, broken, (
+                "Your fix for the rule below is right in intent but the engine now crashes in play. "
+                "Keep the rule fix and make the engine consistent with it — if an internal assertion "
+                "or invariant was written for the old behaviour, update the invariant, do not undo the "
+                "rule.\n\nRULE FIX: " + reason + "\n\nCRASH:\n" + _err), escalate=True)
+            _write_engine(pid, new_code, f"fixed: {label} (made consistent {vround + 1})")
         after = _signature(pid)
         if before is None or after is None or after != before:
             break
@@ -1166,7 +1445,7 @@ def run_jury(pid: str, j: dict) -> None:
     fixes = 0
     to_fix = []
     for c in list(meta.get("checkers") or []):
-        if not c["n_findings"]:
+        if not c["n_findings"] or c.get("suspect"):
             continue
         j["detail"] = f"jury: {c['name']}"
         g = _engine_for(meta)
@@ -1425,6 +1704,7 @@ def generate(pid: str, force: bool = False):
         j["detail"] = "engine quality checks: seat symmetry, termination, determinism"
         meta["quality"] = (quality_report(_engine_for(meta)) if meta.get("builtin") else
                            sandbox.run("quality", timeout=900, path=str(DATA / pid / "game.py")))
+        meta["quality_stale"] = False
         m = _load(pid)  # _write_engine updated versions; merge into the saved copy
         m["engine"] = "generated"
         m["current_label"] = f"generated ({rounds} repair rounds)" if rounds else "generated (first try)"
@@ -1465,11 +1745,38 @@ def run_sim(pid: str, req: SimRequest):
         else:  # generated engines: run in a killable child process
             game = _engine_for(meta)
             t0 = time.time()
-            records = sandbox.run("play", timeout=900, path=str(DATA / pid / "game.py"), specs=specs,
-                                  n_games=req.games, rotate=req.rotate)
+            j["detail"] = f"playing {req.games} games"
+            records = sandbox.run_parallel("play", n_games=req.games, path=str(DATA / pid / "game.py"),
+                                           specs=specs, rotate=req.rotate,
+                                           on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+            stuck = [r.seed for r in records if r.extra.get("unfinished")]
+            if stuck:
+                j["detail"] = f"{len(stuck)} game(s) never ended — replaying one to see why"
+                try:
+                    tail = sandbox.run("stuck_tail", timeout=300, path=str(DATA / pid / "game.py"),
+                                       specs=specs, seed=stuck[0], rotate=req.rotate)
+                    meta["stuck_diagnosis"] = {"seeds": stuck[:20], "seed": stuck[0], **tail}
+                except Exception as e:
+                    meta["stuck_diagnosis"] = {"seeds": stuck[:20], "error": str(e)[-500:]}
+            else:
+                meta.pop("stuck_diagnosis", None)
             secs = time.time() - t0
         j["detail"] = "writing the report"
         md = make_report(records, game)
+        sd = meta.get("stuck_diagnosis")
+        if sd:
+            md += "\n## Games that never ended — what was happening\n"
+            if sd.get("error"):
+                md += f"(could not replay: {sd['error']})\n"
+            else:
+                md += (f"{len(sd['seeds'])} game(s) hit the action cap (game numbers {sd['seeds'][:8]}). "
+                       f"The last turns of game {sd['seed']}, in the engine's own words:\n\n")
+                md += "\n".join(f"- {t}" for t in sd["tail"]) + "\n\n"
+                md += f"Position at the cap: {sd['state']}\n\n"
+                md += (f"The player to move has {sd['n_legal']} legal action(s): " + "; ".join(sd["legal"]) + "\n\n"
+                       "**Finding**: this is a position the rules let repeat forever. Either the rulebook needs "
+                       "an ending for it (e.g. \"if every player passes in succession, the game ends\") or the "
+                       "engine is not applying such a rule. Add it as a clarification and rebuild.\n")
         header = (f"_{req.games} games · {req.players} players · seats: "
                   f"{req.agents}{' · seats rotated' if req.rotate else ''} · "
                   f"{secs:.0f}s_\n\n")
@@ -1535,6 +1842,7 @@ def run_second_opinion(pid: str):
         j["detail"] = "comparing the two engines on random play"
         meta["second_opinion"] = sandbox.run("second", timeout=900, path_a=str(DATA / pid / "game.py"),
                                              path_b=str(DATA / pid / "game2.py"))
+        meta["second_opinion_stale"] = False
         missing = _missing_components(meta)
         if missing and any(r.get("status") == "flag" for r in meta["second_opinion"] if isinstance(r, dict)):
             meta["second_opinion"].insert(0, {
@@ -1569,9 +1877,25 @@ def project_jobs(pid: str):
     return out
 
 
+def _build_stamp() -> str:
+    """Short git commit + code file times, so the page can show what's running."""
+    import subprocess
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT),
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        sha = ""
+    newest = max((p.stat().st_mtime for p in [ROOT / "web" / "app.py", ROOT / "web" / "llm.py",
+                                                ROOT / "web" / "static" / "index.html"] if p.exists()), default=0)
+    return f"{sha or 'no-git'} · code {time.strftime('%b %d %H:%M', time.localtime(newest))} · server up since {time.strftime('%H:%M', time.localtime(SERVER_START))}"
+
+
+SERVER_START = time.time()
+
+
 @app.get("/api/config")
 def config():
-    return {"dev": DEV_MODE}
+    return {"dev": DEV_MODE, "build": _build_stamp()}
 
 
 @app.post("/api/jobs/{jid}/cancel")
@@ -1594,6 +1918,21 @@ def job_status(jid: str):
     j = dict(JOBS[jid])
     j["elapsed"] = round(time.time() - j["started"], 1)
     return j
+
+
+@app.post("/api/jobs/{jid}/continue")
+def continue_job(jid: str):
+    """Raise a paused job's cap so it goes on from where it stopped."""
+    j = JOBS.get(jid)
+    if not j or not j.get("paused"):
+        raise HTTPException(400, "that run is not paused")
+    dict.__setitem__(j, "cap_raised", j["paused"]["offer"])
+    return {"ok": True, "cap": j["paused"]["offer"]}
+
+
+@app.get("/api/estimates")
+def estimates():
+    return ESTIMATES
 
 
 @app.get("/")
