@@ -8,3 +8,4 @@ mutants/
 data/
 *.egg-info/
 .env
+node_modules/

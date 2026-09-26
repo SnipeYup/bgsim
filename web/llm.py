@@ -560,6 +560,61 @@ def verify_claim(claim: str, record: str) -> dict:
     return {"contradicted": bool(d.get("contradicted")), "why": str(d.get("why", ""))[:300]}
 
 
+STRATEGY_PROMPT = """A board game simulation exposes these numeric features of a position, \
+from one player's point of view (higher = more of it):
+{features}
+
+A designer describes a play style: "{description}"
+
+Turn it into weights, one per feature, for a one-move-lookahead player that \
+picks the action whose resulting position maximises sum(weight * feature). \
+Positive weights pursue a feature, negative avoid it, 0 ignores it. Keep the \
+score/points feature positive (players still want to win) but let the style \
+dominate: e.g. "rush cheap cards" weights card count highly and tokens low; \
+"hoard gold" weights gold highly. Weights are floats roughly in -10..10.
+
+Return ONLY a JSON object: {{"name": "<2-4 word name>", "weights": {{"<feature>": <float>, ...}}, \
+"rationale": "<one sentence>"}}
+"""
+
+
+def strategy_weights(feature_names: list[str], description: str) -> dict:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    d = _json_obj_call(key, STRATEGY_PROMPT.format(features="\n".join(f"- {f}" for f in feature_names),
+                                                 description=description[:600]), max_tokens=1500)
+    w = d.get("weights", {})
+    weights = [float(w.get(f, 0.0)) for f in feature_names]
+    return {"name": str(d.get("name", description[:24]))[:40], "weights": weights,
+            "rationale": str(d.get("rationale", ""))[:300]}
+
+
+PHRASE_Q_PROMPT = """A board game simulation reached a position where play went round in circles: \
+the same moves repeated and nothing changed, so the game could never end. The \
+designer needs to decide what the rules should say. Below are the last moves \
+and the engine's dump of the position (technical). Write, for the designer:
+- "scenario": 2-3 plain sentences describing the situation as they would see it \
+at the table — who has what, why nobody can make progress. No code words, no \
+variable names, no "P0"/"P1": say "one player" / "the other player".
+- "question": one sentence asking what the rules should say happens here.
+- "options": two complete rules the designer could adopt, each one sentence, \
+the first ending the game, the second forcing progress.
+Return ONLY a JSON object: {{"scenario": "...", "question": "...", "options": ["...", "..."]}}
+
+=== last moves ===
+{moves}
+
+=== position (technical) ===
+{state}
+"""
+
+
+def phrase_rules_question(moves: list[str], state: str) -> dict:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    d = _json_obj_call(key, PHRASE_Q_PROMPT.format(moves="\n".join(moves[-8:]), state=state[:1500]), max_tokens=800)
+    opts = [str(o)[:300] for o in d.get("options", [])][:2]
+    return {"scenario": str(d.get("scenario", ""))[:600], "question": str(d.get("question", ""))[:200], "options": opts}
+
+
 def explain_findings(rulebook: str, findings: dict[str, list[str]],
                      moments: dict[str, str] | None = None) -> dict:
     key = os.environ.get("ANTHROPIC_API_KEY")

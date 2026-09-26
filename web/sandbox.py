@@ -70,9 +70,12 @@ def play(path: str, specs: list[str], n_games: int, rotate: bool, seed0: int = 0
         if rotate:
             k = seed % len(specs)
             order = order[k:] + order[:k]
-        agents = [make_agent(specs[j], seed * 100 + i) for i, j in enumerate(order)]
+        agents = [_agent_for(specs[j], seed * 100 + i) for i, j in enumerate(order)]
         rec = play_game(game, agents, seed, debug=debug)
-        rec.extra["seat_agent"] = [specs[j] for j in order]
+        rec.extra["seat_agent"] = [(specs[j] if isinstance(specs[j], str) else specs[j].get("name", "strategy")) for j in order]
+        pops = [sp.get("population", {}).get("seed") for sp in specs if isinstance(sp, dict) and "population" in sp]
+        if pops:
+            rec.extra["population"] = pops[0]
         out.append(rec)
     return out
 
@@ -129,6 +132,25 @@ def _desc(da, st, a):
         return str(da(a))
 
 
+def narrate(path: str, specs: list[str], seed: int, rotate: bool, max_steps: int = 400):
+    """One full game in the engine's own words, for the report's sample games."""
+    from bgsim.agents import make_agent
+    game = load_engine(path)
+    order = list(range(len(specs)))
+    if rotate:
+        k = seed % len(specs); order = order[k:] + order[:k]
+    agents = [_agent_for(specs[j], seed * 100 + i) for i, j in enumerate(order)]
+    st = game.initial_state(len(specs), seed); i = 0; lines = []
+    ds = getattr(game, "describe_state", None); da = getattr(game, "describe_action", None)
+    while not game.is_terminal(st) and i < max_steps:
+        p = game.current_player(st); a = agents[p].act(game, st, p)
+        lines.append(f"{i + 1}. Player {p + 1}: {_desc(da, st, a)}")
+        st = game.apply(st, a); i += 1
+    scores = game.scores(st)
+    return {"seed": seed, "ended": game.is_terminal(st), "steps": i, "lines": lines,
+            "final": ds(st)[:500] if ds else "", "scores": [list(s) if isinstance(s, (tuple, list)) else s for s in scores]}
+
+
 def stuck_tail(path: str, specs: list[str], seed: int, rotate: bool, n_tail: int = 10, max_steps: int = 4000):
     """Replay one game and return the last steps in the engine's own words,
     plus the current player's legal actions — to show WHY a game never ends."""
@@ -169,6 +191,132 @@ def find_failure(path: str, players=(2, 3, 4), seeds: int = 400):
     return None
 
 
+def feature_names(path: str):
+    game = load_engine(path)
+    names = list(getattr(game, "FEATURE_NAMES", ()) or ())
+    st = game.initial_state(2, 0)
+    n = len(game.features(st, 0))
+    if len(names) != n:
+        names = (names + [f"feature_{i}" for i in range(n)])[:n]
+    return names
+
+
+def _agent_for(spec, seed):
+    """spec: a make_agent string, {"weights": [...]} or {"population": {...}}."""
+    from bgsim.agents import make_agent, GreedyAgent
+    if isinstance(spec, dict) and "population" in spec:
+        from bgsim.analysis.players import PopulationAgent
+        return PopulationAgent(spec["population"], seed, name=spec.get("name", "trained"))
+    if isinstance(spec, dict):
+        return GreedyAgent(spec["weights"], seed, name=spec.get("name", "strategy"))
+    return make_agent(spec, seed)
+
+
+def matrix(path: str, strategies: list, n_players: int, games_per_pair: int):
+    """Round-robin: each unordered pair plays games_per_pair games with the two
+    strategies alternating seats (for 3-4 players, A B A B… rotated). Returns
+    out[i][j] = share of games in the (i, j) pairing won by i (ties split)."""
+    from bgsim.engine import play_game
+    game = load_engine(path)
+    k = len(strategies)
+    out = [[None] * k for _ in range(k)]
+    pairs = [(i, jdx) for i in range(k) for jdx in range(i + 1, k)]
+    total = len(pairs) * games_per_pair; done = 0
+    for i, jdx in pairs:
+        wi = wj = 0.0
+        for g in range(games_per_pair):
+            _tick(done, total); done += 1
+            seats = [(i if (s + g) % 2 == 0 else jdx) for s in range(n_players)]
+            agents = [_agent_for(strategies[si], g * 100 + s) for s, si in enumerate(seats)]
+            rec = play_game(game, agents, 7000 + i * 1000 + jdx * 100 + g)
+            for w in rec.winners:
+                if seats[w] == i:
+                    wi += 1 / len(rec.winners)
+                else:
+                    wj += 1 / len(rec.winners)
+        out[i][jdx] = wi / games_per_pair
+        out[jdx][i] = wj / games_per_pair
+    return out
+
+
+def counter(path: str, target: dict, n_players: int = 2, pop_size: int = 12, generations: int = 6,
+            games_per_eval: int = 20, seed: int = 0):
+    """Evolve a strategy whose only fitness is beating `target`."""
+    import random
+    from bgsim.engine import play_game
+    from bgsim.agents import GreedyAgent
+    game = load_engine(path)
+    tw = target["weights"]; dim = len(tw)
+    rng = random.Random(seed)
+    pop = [[w + rng.gauss(0, 0.35) for w in tw] for _ in range(pop_size // 2)]
+    pop += [[rng.uniform(-1, 1) * (10 if i == 0 else 1) for i in range(dim)] for _ in range(pop_size - len(pop))]
+
+    def h2h(cand, games, base):
+        w = 0.0
+        for g in range(games):
+            seats = [(0 if (s + g) % 2 == 0 else 1) for s in range(n_players)]
+            agents = [GreedyAgent(cand if si == 0 else tw, g * 10 + s) for s, si in enumerate(seats)]
+            rec = play_game(game, agents, base + g)
+            for win in rec.winners:
+                if seats[win] == 0:
+                    w += 1 / len(rec.winners)
+        return w / games
+    total = generations * pop_size; done = 0; hist = []; gs = 90_000
+    for gen in range(generations):
+        fit = []
+        for cand in pop:
+            _tick(done, total); done += 1
+            fit.append(h2h(cand, games_per_eval, gs)); gs += games_per_eval
+        order = sorted(range(pop_size), key=lambda i: -fit[i])
+        hist.append({"gen": gen, "best": fit[order[0]]})
+        surv = [pop[i] for i in order[: pop_size // 2]]
+        kids = []
+        while len(surv) + len(kids) < pop_size:
+            a, b = rng.sample(surv, 2)
+            kids.append([(x if rng.random() < 0.5 else y) + rng.gauss(0, 0.35) for x, y in zip(a, b)])
+        pop = surv + kids
+    best = pop[0]
+    confirm = h2h(best, 120, 990_000)
+    return {"weights": [round(x, 3) for x in best], "winrate_vs_target": round(confirm, 3), "history": hist}
+
+
+def balance(path: str, n_players: int = 2, rounds: int = 4, seed: int = 0, budget_s: int = 900):
+    from bgsim.analysis.balance import balance_scan
+    game = load_engine(path)
+    names = list(getattr(game, "FEATURE_NAMES", ()) or ())
+    done = [0]
+    def tick():
+        done[0] += 1; _tick(done[0], 400)
+    return balance_scan(game, names, n_players=n_players, rounds=rounds, seed=seed, tick=tick, budget_s=budget_s)
+
+
+def competent(path: str, n_players: int, n_games: int, iterations: int = 60, seed0: int = 0):
+    """Games between MCTS players, for seat/lock-in figures under competent play."""
+    from bgsim.agents.mcts import MCTSAgent
+    from bgsim.engine import play_game
+    game = load_engine(path)
+    out = []
+    for k, seed in enumerate(range(seed0, seed0 + n_games)):
+        _tick(k, n_games)
+        agents = [MCTSAgent(iterations=iterations, seed=seed * 10 + i) for i in range(n_players)]
+        rec = play_game(game, agents, seed)
+        rec.extra["seat_agent"] = [f"mcts{iterations}"] * n_players
+        out.append(rec)
+    return out
+
+
+def train(path: str, n_players: int = 2, populations: int = 3, rounds: int = 2, budget_s: int = 600, size: str = "normal"):
+    from bgsim.analysis.players import train_populations, strength_ladder
+    game = load_engine(path)
+    names = list(getattr(game, "FEATURE_NAMES", ()) or ())
+    done = [0]
+    def tick():
+        done[0] += 1; _tick(done[0], 300)
+    pops = train_populations(game, names, n_players, populations=populations, rounds=rounds, tick=tick, budget_s=budget_s, size=size)
+    ladder = strength_ladder(game, pops, n_players)
+    return {"populations": pops, "ladder": ladder}
+
+
 def schema(path: str):
     from bgsim.trace import record_trace, print_schema
     return print_schema(record_trace(load_engine(path), ["random", "random"], 2, 0))
@@ -184,7 +332,7 @@ def second(path_a: str, path_b: str, n_games: int = 150):
     return second_opinion(load_engine(path_a), load_engine(path_b), n_games=n_games)
 
 
-TASKS = {"validate": validate, "play": play, "audit": audit, "schema": schema, "signature": signature, "stuck_tail": stuck_tail, "find_failure": find_failure,
+TASKS = {"validate": validate, "play": play, "audit": audit, "schema": schema, "signature": signature, "stuck_tail": stuck_tail, "find_failure": find_failure, "feature_names": feature_names, "matrix": matrix, "counter": counter, "balance": balance, "competent": competent, "train": train, "narrate": narrate,
          "quality": quality, "second": second}
 
 
@@ -226,10 +374,13 @@ def run(name: str, timeout: float = 300, stall: float = 240, on_progress=None, h
                         pass
             started = bool(last_seen)
             limit = stall if started else timeout
-            if now - last_change > limit or now - t0 > hard_max:
+            # the ceiling only fires when the child is also NOT progressing: a
+            # laptop that slept for hours and woke up mid-run must not be killed
+            over_ceiling = now - t0 > hard_max and now - last_change > 30
+            if now - last_change > limit or over_ceiling:
                 proc.kill(); proc.wait(5)
                 what = (f"no game finished for {int(limit)} seconds (progress stuck at {last_seen or 'nothing'})"
-                        if now - t0 <= hard_max else f"exceeded the {int(hard_max / 3600)}-hour ceiling")
+                        if not over_ceiling else f"exceeded the {int(hard_max / 3600)}-hour ceiling without finishing")
                 raise EngineHung(
                     f"the engine stalled during '{name}': {what}. This almost always means a rule loops "
                     "forever (a phase that never ends, a forced action that never resolves, or no end "

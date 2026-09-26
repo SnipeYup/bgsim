@@ -111,6 +111,12 @@ def _mark_stale(meta: dict) -> None:
         if meta.get(k):
             meta[f"{k}_stale"] = True
     meta["needs_regeneration"] = False
+    # strategies are weights over THIS engine's features: derived ones are dropped,
+    # designer-described ones are kept but must be re-translated
+    meta.pop("feature_names", None)
+    meta.pop("balance_scan", None); meta.pop("matrix", None); meta.pop("counter_findings", None)
+    meta.pop("competent_report", None); meta.pop("players", None); meta.pop("analysis", None)
+    meta["strategies"] = [dict(st, stale=True) for st in meta.get("strategies", []) if st.get("source") == "designer"]
 
 
 def _write_engine(pid: str, code: str, label: str) -> None:
@@ -384,6 +390,13 @@ def create_project(req: NewProject):
 @app.get("/api/projects/{pid}")
 def get_project(pid: str):
     return _load(pid)
+
+
+@app.get("/api/projects/{pid}/rulebook")
+def get_rulebook(pid: str):
+    _load(pid)
+    rb = DATA / pid / "rulebook.txt"
+    return {"text": rb.read_text(encoding="utf-8") if rb.exists() else ""}
 
 
 @app.delete("/api/projects/{pid}")
@@ -1594,6 +1607,278 @@ def inbox_undo(pid: str, req: WorkshopAnswer):
     return meta
 
 
+# ============================ strategies / balance =========================
+
+class StrategyReq(BaseModel):
+    description: str = ""
+    index: int | None = None
+    players: int = 2
+    games_per_pair: int = 60
+
+
+def _engine_path(meta: dict) -> str | None:
+    return None if meta.get("builtin") else str(DATA / meta["id"] / "game.py")
+
+
+def _feature_names(meta: dict) -> list[str]:
+    if meta.get("feature_names"):
+        return meta["feature_names"]
+    if meta.get("builtin"):
+        g = _engine_for(meta)
+        names = list(getattr(g, "FEATURE_NAMES", ()) or ())
+        n = len(g.features(g.initial_state(2, 0), 0))
+        names = (names + [f"feature_{i}" for i in range(n)])[:n]
+    else:
+        names = sandbox.run("feature_names", timeout=60, path=_engine_path(meta))
+    meta["feature_names"] = names
+    _save(meta)
+    return names
+
+
+def _strategy_specs(meta: dict):
+    """Baselines plus the designer's strategies, as sandbox specs."""
+    specs, names = ["scoregreedy"], ["score-greedy (baseline)"]
+    n = len(_feature_names(meta))
+    for st in meta.get("strategies", []):
+        if st.get("stale") or len(st.get("weights", [])) != n:
+            continue
+        specs.append({"name": st["name"], "weights": st["weights"]}); names.append(st["name"])
+    return specs, names
+
+
+@app.post("/api/projects/{pid}/strategies")
+def add_strategy(pid: str, req: StrategyReq):
+    """Designer describes a play style in words; a model turns it into weights
+    over the engine's named features (one cheap call)."""
+    meta = _load(pid)
+    if not req.description.strip():
+        raise HTTPException(400, "describe the play style first")
+    names = _feature_names(meta)
+    job = _job("strategy", pid)
+
+    def work(j):
+        j["detail"] = "translating the play style into weights"
+        st = llm.strategy_weights(names, req.description.strip())
+        st["description"] = req.description.strip(); st["source"] = "designer"; st["features"] = names
+        m = _load(pid); m.setdefault("strategies", []).append(st); _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/strategies/{index}/retranslate")
+def retranslate_strategy(pid: str, index: int):
+    meta = _load(pid)
+    sts = meta.get("strategies", [])
+    if not 0 <= index < len(sts):
+        raise HTTPException(404, "no such strategy")
+    names = _feature_names(meta)
+    desc = sts[index].get("description", "")
+    job = _job("strategy", pid)
+
+    def work(j):
+        j["detail"] = "re-translating for the rebuilt engine"
+        st = llm.strategy_weights(names, desc)
+        m = _load(pid)
+        m["strategies"][index] = {**st, "description": desc, "source": "designer", "features": names}
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.delete("/api/projects/{pid}/strategies/{index}")
+def delete_strategy(pid: str, index: int):
+    meta = _load(pid)
+    sts = meta.get("strategies", [])
+    if not 0 <= index < len(sts):
+        raise HTTPException(404, "no such strategy")
+    sts.pop(index); meta["strategies"] = sts; meta.pop("matrix", None)
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/balance/matrix")
+def balance_matrix(pid: str, req: StrategyReq):
+    """Round-robin between the baseline and every designer strategy. Free."""
+    meta = _load(pid)
+    specs, names = _strategy_specs(meta)
+    if len(specs) < 2:
+        raise HTTPException(400, "add at least one strategy first")
+    job = _job("simulate", pid)
+
+    def work(j):
+        j["detail"] = f"{len(specs)} strategies, every pair, {req.games_per_pair} games each, {req.players} players"
+        if meta.get("builtin"):
+            raise RuntimeError("round-robin runs on generated engines only for now")
+        table = sandbox.run("matrix", timeout=600, stall=300, path=_engine_path(meta), strategies=specs,
+                            n_players=req.players, games_per_pair=req.games_per_pair,
+                            on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+        k = len(names)
+        avg = [sum(x for x in row if x is not None) / max(1, k - 1) for row in table]
+        findings = []
+        for i in range(k):
+            others = [x for x in table[i] if x is not None]
+            if others and min(others) >= 0.65:
+                findings.append(f"**{names[i]}** beats every other strategy tested (never below {min(others):.0%}). "
+                                "If nothing counters it, it is a dominant strategy.")
+            if others and max(others) <= 0.35:
+                findings.append(f"**{names[i]}** loses to everything (never above {max(others):.0%}) — "
+                                "either this play style is a trap or the engine undervalues it.")
+        m = _load(pid)
+        m["matrix"] = {"names": names, "players": req.players, "games_per_pair": req.games_per_pair,
+                       "table": table, "average": avg, "findings": findings, "time": time.time()}
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/balance/counter")
+def balance_counter(pid: str, req: StrategyReq):
+    """Evolve a strategy whose only goal is beating the chosen one. Free (CPU)."""
+    meta = _load(pid)
+    specs, names = _strategy_specs(meta)
+    if req.index is None or not 0 <= req.index < len(specs):
+        raise HTTPException(400, "pick a strategy to counter")
+    target = specs[req.index]
+    if isinstance(target, str):   # baseline: derive weights by asking the engine-agnostic greedy to be countered as 'points only'
+        n = len(_feature_names(meta)); target = {"name": names[req.index], "weights": [10.0] + [0.0] * (n - 1)}
+    job = _job("simulate", pid)
+
+    def work(j):
+        j["detail"] = f"evolving a counter to {names[req.index]} ({req.players} players)"
+        res = sandbox.run("counter", timeout=900, stall=300, path=_engine_path(meta), target=target,
+                          n_players=req.players, on_progress=lambda t: dict.__setitem__(j, "progress", f"candidates {t}"))
+        m = _load(pid)
+        st = {"name": f"counter to {names[req.index]}", "weights": res["weights"], "source": "counter",
+              "description": f"evolved purely to beat '{names[req.index]}'",
+              "rationale": f"wins {res['winrate_vs_target']:.0%} of games against it"}
+        m.setdefault("strategies", []).append(st)
+        verdict = (f"**{names[req.index]} can be countered**: an evolved strategy beats it {res['winrate_vs_target']:.0%} of the time."
+                   if res["winrate_vs_target"] >= 0.55 else
+                   f"**No counter found to {names[req.index]}**: the best evolved opponent wins only {res['winrate_vs_target']:.0%}. "
+                   "If it also tops the round-robin, this looks like a dominant strategy.")
+        m.setdefault("counter_findings", []).append(verdict)
+        m.pop("matrix", None)   # the table is out of date once a strategy is added
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+class AnalysisReq(BaseModel):
+    kind: str = "competitive"         # competitive | family
+    counts: list[int] = [2, 4]
+    primary: int = 2
+    target_minutes: int | None = None
+
+
+@app.post("/api/projects/{pid}/balance/analyze")
+def balance_analyze(pid: str, req: AnalysisReq):
+    """The one button: train players if needed, measure everything under
+    trained play at each count, write one report. CPU only."""
+    from web.analysis import run_analysis
+    meta = _load(pid)
+    if meta.get("builtin") or meta.get("engine") != "generated":
+        raise HTTPException(400, "needs a generated engine")
+    job = _job("simulate", pid)
+    prof = req.model_dump()
+
+    def work(j):
+        res = run_analysis(pid, meta, j, prof, sandbox, _engine_path(meta), _load, _save)
+        m = _load(pid)
+        m["analysis"] = {**res, "engine_version": len(m.get("versions", []))}
+        m["balance_profile"] = prof
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/analysis/clear-questions")
+def clear_analysis_questions(pid: str):
+    meta = _load(pid)
+    if meta.get("analysis"):
+        meta["analysis"]["questions"] = []
+        meta["analysis"]["findings"] = [f for f in meta["analysis"]["findings"] if f[0] != "question"]
+    _save(meta)
+    return meta
+
+
+@app.post("/api/projects/{pid}/players/train")
+def train_players(pid: str, req: StrategyReq):
+    """Train player populations for this engine at a player count (CPU only,
+    ~10 min). Cached with the engine version; every later measurement uses them."""
+    meta = _load(pid)
+    if meta.get("builtin") or meta.get("engine") != "generated":
+        raise HTTPException(400, "needs a generated engine")
+    job = _job("simulate", pid)
+
+    def work(j):
+        j["detail"] = f"training players for {req.players}-player games (3 independent populations)"
+        res = sandbox.run("train", timeout=1800, stall=600, path=_engine_path(meta), n_players=req.players,
+                          populations=3, rounds=2, budget_s=600,
+                          on_progress=lambda t: dict.__setitem__(j, "progress", f"step {t}"))
+        m = _load(pid)
+        m.setdefault("players", {})[str(req.players)] = {**res, "time": time.time(),
+                                                        "engine_version": len(m.get("versions", []))}
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/balance/scan")
+def balance_scan_ep(pid: str, req: StrategyReq):
+    """Automatic balance analysis: evolve, double-oracle, equilibrium,
+    archetypes, sensitivity. CPU only, no designer input, no model."""
+    meta = _load(pid)
+    if meta.get("builtin") or meta.get("engine") != "generated":
+        raise HTTPException(400, "needs a generated engine")
+    job = _job("simulate", pid)
+
+    def work(j):
+        j["detail"] = f"balance scan at {req.players} players: evolving strategies, mapping the meta-game"
+        res = sandbox.run("balance", timeout=1800, stall=600, hard_max=1500, path=_engine_path(meta), n_players=req.players,
+                          budget_s=900, on_progress=lambda t: dict.__setitem__(j, "progress", f"step {t}"))
+        m = _load(pid); m["balance_scan"] = {**res, "time": time.time()}
+        # the discovered strategies become usable in the strategies stage and the seat picker
+        m["strategies"] = [x for x in m.get("strategies", []) if x.get("source") != "scan"]
+        for lab, st, arch in zip(res["labels"], res["strategies"], res["archetypes"]):
+            if "weights" in st:
+                m["strategies"].append({"name": lab, "weights": st["weights"], "source": "scan",
+                                        "description": arch, "rationale": "found by the balance scan",
+                                        "features": res["feature_names"]})
+        # a counter found earlier that beats the scan's top strategy overrides 'dominant'
+        m.pop("counter_findings", None)
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
+@app.post("/api/projects/{pid}/balance/competent")
+def balance_competent(pid: str, req: StrategyReq):
+    """Seat / lock-in / length figures under MCTS play. CPU only."""
+    meta = _load(pid)
+    if meta.get("builtin") or meta.get("engine") != "generated":
+        raise HTTPException(400, "needs a generated engine")
+    job = _job("simulate", pid)
+    n_games = max(8, min(400, req.games_per_pair))
+
+    def work(j):
+        j["detail"] = f"{n_games} games between MCTS players, {req.players} players (slow: strong play)"
+        recs = sandbox.run_parallel("competent", n_games=n_games, path=_engine_path(meta), n_players=req.players,
+                                    iterations=60, on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+        md = make_report(recs, None)
+        m = _load(pid); m["competent_report"] = {"players": req.players, "games": n_games, "markdown": md, "time": time.time()}
+        _save(m)
+
+    _run_in_thread(job, work)
+    return job
+
+
 # =============================== the runner ===============================
 @app.post("/api/projects/{pid}/run-all")
 def run_all(pid: str, force: bool = False, games: int = 300):
@@ -1746,9 +2031,30 @@ def run_sim(pid: str, req: SimRequest):
             game = _engine_for(meta)
             t0 = time.time()
             j["detail"] = f"playing {req.games} games"
-            records = sandbox.run_parallel("play", n_games=req.games, path=str(DATA / pid / "game.py"),
-                                           specs=specs, rotate=req.rotate,
-                                           on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+            pops = (meta.get("players") or {}).get(str(req.players), {}).get("populations")
+            if "trained" in specs and not pops:
+                raise RuntimeError(f"no trained players for {req.players}-player games yet — train them first (free, ~10 min)")
+            if "trained" in specs and pops:
+                # each population plays its own share of the games, so stability can be checked
+                records = []
+                share = max(1, req.games // len(pops))
+                for k, pop in enumerate(pops):
+                    sp = [({"population": pop, "name": "trained"} if x == "trained" else x) for x in specs]
+                    records += sandbox.run_parallel("play", n_games=share, seed0=k * 10_000, path=str(DATA / pid / "game.py"),
+                                                    specs=sp, rotate=req.rotate,
+                                                    on_progress=lambda t, k=k: dict.__setitem__(j, "progress", f"population {k + 1}/{len(pops)}, games {t}"))
+                play_specs = [({"population": pops[0], "name": "trained"} if x == "trained" else x) for x in specs]
+            else:
+                play_specs = specs
+                records = sandbox.run_parallel("play", n_games=req.games, path=str(DATA / pid / "game.py"),
+                                               specs=specs, rotate=req.rotate,
+                                               on_progress=lambda t: dict.__setitem__(j, "progress", f"games {t}"))
+            j["detail"] = "narrating two sample games"
+            try:
+                meta["sample_games"] = [sandbox.run("narrate", timeout=120, path=str(DATA / pid / "game.py"),
+                                                    specs=play_specs, seed=sd, rotate=req.rotate) for sd in (0, 1)]
+            except Exception as e:
+                meta["sample_games"] = []
             stuck = [r.seed for r in records if r.extra.get("unfinished")]
             if stuck:
                 j["detail"] = f"{len(stuck)} game(s) never ended — replaying one to see why"
@@ -1763,6 +2069,23 @@ def run_sim(pid: str, req: SimRequest):
             secs = time.time() - t0
         j["detail"] = "writing the report"
         md = make_report(records, game)
+        L = (meta.get("players") or {}).get(str(req.players), {}).get("ladder")
+        if L:
+            md = (f"## How good are the players behind these numbers?\n"
+                  f"Rounds to finish a {req.players}-player game: random play {L['random']['rounds']:.0f} · "
+                  f"novice (one-move greedy) {L['novice']['rounds']:.0f} · **trained {L['trained']['rounds']:.0f}**. "
+                  f"Trained players beat the novice {L['trained_beats_novice']:.0%} of the time. "
+                  + ("This run used the trained players." if "trained" in req.agents else
+                     "**This run used " + req.agents.split(',')[0] + " players; results under trained play can differ.**")
+                  + "\n\n") + md
+        n = len(records); wins0 = sum((1 / len(r.winners)) for r in records if 0 in r.winners)
+        meta["last_report"] = {"games": n, "players": req.players, "agents": req.agents,
+                               "seat0": round(wins0 / n, 3) if n else None,
+                               "unfinished": sum(1 for r in records if r.extra.get("unfinished")), "time": time.time()}
+        for k, sg in enumerate(meta.get("sample_games") or []):
+            md += f"\n## Sample game {k + 1} — how these players actually play\n"
+            md += f"Final scores {sg['scores']}; {sg['steps']} moves{'' if sg['ended'] else ' (cut off)'}.\n\n<details><summary>every move</summary>\n\n"
+            md += "\n".join(sg["lines"]) + "\n\n</details>\n"
         sd = meta.get("stuck_diagnosis")
         if sd:
             md += "\n## Games that never ended — what was happening\n"

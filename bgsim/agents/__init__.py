@@ -82,6 +82,10 @@ def make_agent(spec: str, seed: int = 0):
         w = [rng.uniform(-1, 1) for _ in EXPERT_WEIGHTS]
         w[0] = abs(w[0]) * 10  # points always matter
         return GreedyAgent(w, seed, name="greedy")
+    if spec == "mcts" or spec.startswith("mcts:"):
+        from .mcts import MCTSAgent
+        it = int(spec.split(":", 1)[1]) if ":" in spec else 60
+        return MCTSAgent(iterations=it, seed=seed, name=f"mcts{it}")
     if spec.startswith("greedy:"):
         return GreedyAgent(json.loads(spec[len("greedy:"):]), seed, name="greedy")
     if spec.startswith("greedy@"):

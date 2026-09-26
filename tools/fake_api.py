@@ -83,6 +83,12 @@ class H(BaseHTTPRequestHandler):
             mnum = _re.search(r"deck (\d)", claim)
             bad = bool(mnum) and f"decks[{mnum.group(1)}]" not in record and "decks[" in record
             return self._stream_text(json.dumps({"contradicted": bad, "why": "the record shows deck 2 changed, which the action referred to" if bad else "record matches the claim"}))
+        if "play went round in circles" in text:
+            return self._stream_text(json.dumps({"scenario": "Both players hold ten gems each, so the bank is empty. Neither can afford any card on the table and both already hold three reserved cards, so nobody can take a gem, buy, or reserve.", "question": "When no one can take any useful action, how should the game end?", "options": ["If every player passes in a row, the game ends at once and is scored as it stands.", "A player must return gems to the bank on their turn if they cannot otherwise act, so play can continue."]}))
+        if "A designer describes a play style" in text:
+            feats = [l[2:].strip() for l in text.split("(higher = more of it):")[1].split("A designer")[0].splitlines() if l.startswith("- ")]
+            w = {f: (3.0 if i == 0 else (6.0 if "card" in f or i == 1 else 0.0)) for i, f in enumerate(feats)}
+            return self._stream_text(json.dumps({"name": "card rusher", "weights": w, "rationale": "cards over tokens"}))
         if "You are the gatekeeper" in text:
             n = text.split("=== questions ===")[1].count("\n")
             qs = [q for q in text.split("=== questions ===")[1].strip().split("\n") if q.strip()]

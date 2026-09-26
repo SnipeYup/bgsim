@@ -27,6 +27,9 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
               f"- unfinished (hit the action cap; rules allow indefinite play): "
               f"{sum(1 for r in records if r.extra.get('unfinished'))}", ""]
 
+    # --- stability: the same headline numbers under each trained population
+    lines += stability(records)
+
     # --- lead lock-in (a finding, not a fault: some games are meant to snowball)
     lines += lead_lockin(records)
 
@@ -59,7 +62,53 @@ def report(records: list[GameRecord], game=None, top: int = 10) -> str:
               f"- winner points: mean {mean(win_pts):.1f}",
               f"- all players: mean {mean(pts):.1f}, min {min(pts)}, max {max(pts)}", ""]
 
-    # --- cards
+    # --- end reasons
+    reasons = Counter(str(r.extra.get("end_reason", "")) for r in records if r.extra.get("end_reason"))
+    if reasons:
+        lines += ["## How games ended"] + [f"- {k}: {_pct(v / n)}" for k, v in reasons.most_common()] + [""]
+
+    # --- components (generic): {"components": {set: [[labels] per player]}}
+    comps = {}
+    for r in records:
+        c = r.extra.get("components")
+        if not isinstance(c, dict):
+            continue
+        for set_name, per_player in c.items():
+            if not isinstance(per_player, (list, tuple)):
+                continue
+            tot, winr = comps.setdefault(set_name, (Counter(), Counter()))
+            for seat, labels in enumerate(per_player):
+                if not isinstance(labels, (list, tuple)):
+                    continue
+                for lab in labels:
+                    if not isinstance(lab, (str, int)):
+                        continue
+                    tot[lab] += 1
+                    if seat in r.winners:
+                        winr[lab] += 1
+    for set_name, (tot, winr) in comps.items():
+        if not tot:
+            continue
+        base = sum(1 / max(1, r.n_players) * 0 + (len(r.winners) / r.n_players) for r in records) / n
+        rows = []
+        for lab, cnt in tot.most_common():
+            if cnt < max(10, n // 50):
+                continue
+            rows.append((lab, cnt, winr[lab] / cnt))
+        rows.sort(key=lambda x: -x[2])
+        lines += [f"## {set_name} — who ends up holding them, and does it win",
+                  f"Baseline: a piece held by a random player is in a winning hand about {_pct(base)} of the time.",
+                  "", "| piece | games held | holder wins |", "|---|---|---|"]
+        lines += [f"| {lab} | {cnt} | {_pct(w)} |" for lab, cnt, w in rows[:top]]
+        strong = [lab for lab, cnt, w in rows if w >= base + 0.2 and cnt >= n // 10]
+        weak = [lab for lab, cnt, w in rows if w <= base - 0.2 and cnt >= n // 10]
+        if strong:
+            lines.append(f"- **finding**: holders win far more often than baseline: {', '.join(strong[:6])}")
+        if weak:
+            lines.append(f"- **finding**: holders win far less often than baseline: {', '.join(weak[:6])}")
+        lines.append("")
+
+    # --- cards (Splendor-specific legacy summaries)
     bought, bought_by_winner = Counter(), Counter()
     for r in records:
         purchased = r.extra.get("purchased")
@@ -203,3 +252,57 @@ def lead_lockin(records, fractions=(0.25, 0.4, 0.5, 0.6, 0.75, 0.9)) -> list[str
                  "than a human table; compare between games or versions rather than reading them "
                  "as absolutes")
     return out + [""] + notes + [""]
+
+
+def _headline(recs):
+    n = len(recs)
+    if not n:
+        return None
+    n_players = recs[0].n_players
+    seat0 = sum(1 / len(r.winners) for r in recs if 0 in r.winners) / n
+    rounds = mean(r.n_turns / n_players for r in recs)
+    half = []
+    for r in recs:
+        tl = r.extra.get("timeline")
+        if tl and len(r.winners) == 1:
+            leader, _ = _leader_at(tl, 0.5 * r.n_turns)
+            if leader is not None:
+                half.append(leader in r.winners)
+    lock = (sum(half) / len(half)) if half else None
+    return {"seat0": seat0, "rounds": rounds, "lock50": lock, "n": n}
+
+
+def stability(records) -> list[str]:
+    """If games were played by several independent trained populations, compute
+    the headline numbers per population. Agreement earns the number; a spread
+    flags it as a possible play-style artefact rather than a fact about the game."""
+    by_pop = {}
+    for r in records:
+        tag = r.extra.get("population")
+        if tag is not None:
+            by_pop.setdefault(tag, []).append(r)
+    if len(by_pop) < 2:
+        return []
+    rows = {k: _headline(v) for k, v in by_pop.items()}
+    out = ["## Are these numbers stable across player populations?",
+           "The same games were played by independently trained player populations. Numbers the "
+           "populations agree on are properties of the game; ones they disagree on may be habits of a "
+           "particular set of players.", "",
+           "| population | games | seat 1 wins | rounds | mid-game leader wins |", "|---|---|---|---|---|"]
+    for k, h in sorted(rows.items()):
+        out.append(f"| {k} | {h['n']} | {_pct(h['seat0'])} | {h['rounds']:.1f} | {_pct(h['lock50']) if h['lock50'] is not None else '—'} |")
+    def spread(key):
+        vals = [h[key] for h in rows.values() if h.get(key) is not None]
+        return (max(vals) - min(vals)) if len(vals) > 1 else 0.0
+    flags = []
+    if spread("seat0") > 0.08:
+        flags.append("- **unstable**: the seat-1 win rate differs by more than 8 points between populations — treat the seat effect as unproven")
+    else:
+        flags.append("- seat effect: stable across populations")
+    if spread("lock50") > 0.12:
+        flags.append("- **unstable**: lead lock-in differs by more than 12 points between populations — it depends on how these players play, not only on the rules")
+    else:
+        flags.append("- lead lock-in: stable across populations")
+    rel = spread("rounds") / max(1.0, mean(h["rounds"] for h in rows.values()))
+    flags.append("- game length: " + ("**unstable** (differs by more than 15%)" if rel > 0.15 else "stable"))
+    return out + [""] + flags + [""]

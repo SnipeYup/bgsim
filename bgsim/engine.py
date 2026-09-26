@@ -49,7 +49,26 @@ class Game(Protocol):
         ...
     def features(self, state: State, player: int) -> tuple[float, ...]:
         """Cheap scalar features of `state` from `player`'s viewpoint, used by
-        heuristic agents. Not part of the rules; may be a stub."""
+        heuristic agents to play STRATEGIES. Not part of the rules. Required:
+        8-16 features covering every strategic lever the game has — score,
+        each resource or currency, engine/economy strength (permanent bonuses,
+        buildings, income), tempo (how close to the end/target), holdings that
+        can be cashed in later, and denial of opponents where relevant. Name
+        them in a class attribute FEATURE_NAMES (same order, snake_case): the
+        balance tool turns a designer's plain-language strategy ("rush cheap
+        cards", "hoard gold") into weights over these names."""
+        ...
+    FEATURE_NAMES: tuple[str, ...]
+
+    def summary(self, state: State) -> dict:
+        """Per-game facts for the balance report, from a terminal state:
+        {"components": {"<set name>": [[<label>, ...] per player]}} — every
+        component each player ended the game holding (cards bought, tiles
+        taken, nobles, buildings…), as short readable labels that identify
+        the piece ("L2 blue 2pt #37", "Noble: 4 white 4 black"). Add an
+        "end_reason" string (e.g. "target reached", "everyone passed", "round
+        limit"). Counts alone are not enough: the report correlates specific
+        components with winning."""
         ...
 
 
